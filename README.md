@@ -39,6 +39,8 @@ O ícone de relógio no canto superior direito abre o popup de rotação:
 
 - **checkbox** liga/desliga a troca automática
 - o **spin** logo abaixo define o intervalo, em **segundos** ou **minutos**
+  (minimo 5 segundos: abaixo disso o PC congela -- cada troca sao 2
+  processos, decode de MBs e crossfade em tela cheia, tudo na CPU)
 - o ponteiro do relógio completa uma volta por intervalo, então ele mostra a
   progresso da contagem — para de girar quando a rotação está desligada
 

@@ -143,6 +143,19 @@ DEFAULT_CFG = {
     "cache_limit_mb": 100,  # teto dos originais aplicados no cache
 }
 
+# Piso do intervalo em segundos. Abaixo de 5 o PC congela: cada troca sao
+# 2 processos gsettings + decode de MBs + crossfade em tela cheia, tudo na
+# CPU (sem GPU aqui). 0 continua valendo como manual (so aplica no N).
+MIN_INTERVAL = 5
+
+
+def norm_interval(v, default=300):
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return default
+    return 0 if v <= 0 else max(MIN_INTERVAL, v)
+
 
 def load_config():
     cfg = dict(DEFAULT_CFG)
@@ -154,11 +167,9 @@ def load_config():
             cfg.update(data)
     except (OSError, ValueError, TypeError):
         pass
-    # normaliza o que o codigo consome como numero
-    try:
-        cfg["interval"] = max(0, int(cfg["interval"]))
-    except (TypeError, ValueError):
-        cfg["interval"] = DEFAULT_CFG["interval"]
+    # normaliza o que o codigo consome como numero (1-4s viram 5s)
+    cfg["interval"] = norm_interval(cfg.get("interval"),
+                                    DEFAULT_CFG["interval"])
     try:
         cfg["cache_limit_mb"] = max(1, int(cfg["cache_limit_mb"]))
     except (TypeError, ValueError):
@@ -466,7 +477,7 @@ class Rotator:
 
     def __init__(self, folder, interval, on_apply=None, on_tick=None):
         self.folder = folder
-        self.interval = max(0, int(interval))
+        self.interval = norm_interval(interval)
         self.on_apply = on_apply
         self.on_tick = on_tick
         self.files = []
@@ -498,7 +509,7 @@ class Rotator:
 
     # -- controle ----------------------------------------------------------
     def set_interval(self, sec):
-        self.interval = max(0, int(sec))
+        self.interval = norm_interval(sec, self.interval)
         if self.active:
             self.restart_timer()
 
@@ -990,7 +1001,7 @@ def build_gui():
             # ---- o "time" abaixo da checkbox
             tbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
             tbox.set_margin_start(24)
-            self.spin = Gtk.SpinButton.new_with_range(1, 1440, 1)
+            self.spin = Gtk.SpinButton.new_with_range(MIN_INTERVAL, 1440, 1)
             self.spin.set_numeric(True)
             self.spin.set_width_chars(5)
             self.unit_dd = Gtk.DropDown.new_from_strings(["segundos", "minutos"])
@@ -1048,10 +1059,10 @@ def build_gui():
             try:
                 if unit == "min":
                     self.unit_dd.set_selected(1)
-                    self.spin.set_value(max(1, min(1440, round(iv / 60))))
+                    self.spin.set_value(max(MIN_INTERVAL, min(1440, round(iv / 60))))
                 else:
                     self.unit_dd.set_selected(0)
-                    self.spin.set_value(max(1, min(1440, iv)))
+                    self.spin.set_value(max(MIN_INTERVAL, min(1440, iv)))
             finally:
                 self.spin.handler_unblock_by_func(self.on_interval_changed)
                 self.unit_dd.handler_unblock_by_func(self.on_interval_changed)
@@ -1209,10 +1220,10 @@ def build_gui():
             # realmente mudou de verdade
             if secs == self.cfg.get("interval") and self.rotator.interval == secs:
                 return
-            self.cfg["interval"] = max(1, secs)
+            self.cfg["interval"] = max(MIN_INTERVAL, secs)
             self.cfg["unit"] = "min" if self.unit_dd.get_selected() == 1 else "s"
             save_config(self.cfg)
-            self.rotator.set_interval(max(1, secs))
+            self.rotator.set_interval(max(MIN_INTERVAL, secs))
             self.on_rot_tick(self.rotator)
 
         def on_boot_toggle(self, btn):
