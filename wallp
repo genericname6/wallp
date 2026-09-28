@@ -955,6 +955,7 @@ def build_gui():
             self._cell_geom = None    # (ncols, cw, ch) aplicados por ultimo
             self._laid_out = -1       # quantas celulas o ultimo layout anexou
             self._resize_id = None    # idle de resize pendente
+            self._managed = False     # servico habilitado? (sondado em thread)
             self._query = ""            # busca ativa na web (vazio = aleatorio)
             self._monitor = None      # GFileMonitor da pasta atual
             self._mon_path = ""       # pasta que o monitor vigia
@@ -968,16 +969,9 @@ def build_gui():
             self.connect("close-request", self.on_close)
 
             if cfg.get("rotate"):
-                if self._boot_managed():
-                    # servico instalado: ele gira; garante que esta de pe
-                    # (ex.: voltou de um crash com burst esgotado)
-                    ok, _out = _systemctl("start", "wallp.service")
-                    if ok:
-                        self.rotator.stop()
-                    else:
-                        self.rotator.start()
-                else:
-                    self.rotator.start()
+                # a decisao (servico x processo) precisa do is-enabled, que
+                # bloqueia -- vai numa thread e volta por idle
+                threading.Thread(target=self._boot_probe, daemon=True).start()
             self.sync_rotate_ui()
 
             self.load()
@@ -1069,20 +1063,74 @@ def build_gui():
             if warn:
                 self.status.add_css_class("warning")
 
-        def _boot_managed(self):
-            """O servico do systemd esta habilitado? Se sim, E ELE quem gira
-            e o app nao gira em processo -- senao os dois aplicariam juntos,
-            cada um no seu ritmo. O checkbox passa a seguir o flag (que os
-            dois obedecem), nao o rotator local."""
+        def _boot_probe(self):
+            """Sonda o systemd fora da UI e reconcilia na volta."""
             try:
-                return boot_status() == "enabled"
+                managed = boot_status() == "enabled"
             except Exception:  # noqa: BLE001
+                managed = False
+            GLib.idle_add(self._boot_probed, managed)
+
+        def _boot_probed(self, managed):
+            self._managed = managed
+            if not self.cfg.get("rotate"):
+                self.sync_rotate_ui()
                 return False
+            if managed:
+                threading.Thread(target=self._service_ensure,
+                                 daemon=True).start()
+                self.rotator.stop()
+            else:
+                self.rotator.start()
+            self.sync_rotate_ui()
+            return False
+
+        def _service_ensure(self):
+            """Garante o servico de pe, fora da thread da UI. systemctl
+            bloqueia (foi o congelamento na abertura); se falhar, o
+            fallback gira aqui dentro em vez de deixar parado em silencio."""
+            try:
+                ok, _out = _systemctl("start", "wallp.service")
+            except Exception:  # noqa: BLE001
+                ok = False
+            if not ok:
+                GLib.idle_add(self._service_fallback)
+            return False
+
+        def _service_fallback(self):
+            if self.cfg.get("rotate") and not self.rotator.active:
+                self.rotator.start()
+                self.sync_rotate_ui()
+            return False
+
+        def _service_stop_async(self):
+            """Para o servico fora da UI. Se falhar, avisa na barra: sem
+            isso o usuario desmarca e a rotacao continua (o bug original)."""
+            try:
+                ok, out = _systemctl("stop", "wallp.service")
+            except Exception as e:  # noqa: BLE001
+                ok, out = False, str(e)
+            if not ok:
+                GLib.idle_add(self.say,
+                              f"servico nao parou: {out[:80]}", True)
+            return False
 
         def sync_rotate_ui(self):
-            on = bool(self.cfg.get("rotate"))
-            self.chk_rotate.set_active(on)
-            self.chk_boot.set_active(bool(self.cfg.get("boot")))
+            # NUNCA deixar o set_active programatico disparar os handlers:
+            # sem o bloqueio, abrir o app com boot:true rodava boot_enable
+            # inteiro (daemon-reload + enable --now) dentro do __init__ --
+            # medido: 10s de congelamento na abertura. Mesmo vicio que o
+            # _restore_interval ja tinha com o spin.
+            self.chk_rotate.handler_block_by_func(self.on_rotate_toggle)
+            self.chk_boot.handler_block_by_func(self.on_boot_toggle)
+            try:
+                on = bool(self.cfg.get("rotate"))
+                self.chk_rotate.set_active(on)
+                self.chk_boot.set_active(bool(self.cfg.get("boot")))
+            finally:
+                self.chk_rotate.handler_unblock_by_func(self.on_rotate_toggle)
+                self.chk_boot.handler_unblock_by_func(self.on_boot_toggle)
+            self.chk_rotate.set_sensitive(self.rotator.available())
             self.chk_rotate.set_sensitive(self.rotator.available())
             n = len(self.rotator.files)
             if n:
@@ -1120,24 +1168,26 @@ def build_gui():
             if want:
                 self.cfg["rotate"] = True
                 save_config(self.cfg)
-                if self._boot_managed():
-                    # o servico gira; o app nao gira junto para nao aplicar
-                    # em duplicata. Se o systemd falhar, gira aqui dentro.
+                if self._managed:
+                    # o servico gira; o start vai em thread porque systemctl
+                    # bloqueia a UI. O app nao gira junto para nao aplicar
+                    # em duplicata; se o start falhar, o fallback gira aqui.
                     self.rotator.stop()
-                    ok, _out = _systemctl("start", "wallp.service")
-                    if not ok:
-                        self.rotator.start()
+                    threading.Thread(target=self._service_ensure,
+                                     daemon=True).start()
                 else:
                     self.rotator.start()
             else:
                 # desligar aqui desliga em todo lugar: o daemon obedece o
-                # flag e o servico e parado junto. Era esse o bug: antes o
-                # daemon ignorava o flag e continuava sozinho.
+                # flag e o servico e parado junto (em thread, sem travar).
+                # Era esse o bug: antes o daemon ignorava o flag e
+                # continuava sozinho.
                 self.cfg["rotate"] = False
                 save_config(self.cfg)
                 self.rotator.stop()
-                if self._boot_managed():
-                    _systemctl("stop", "wallp.service")
+                if self._managed:
+                    threading.Thread(target=self._service_stop_async,
+                                     daemon=True).start()
             self.sync_rotate_ui()
 
         def on_interval_changed(self, *_):
@@ -1156,12 +1206,14 @@ def build_gui():
         def on_boot_toggle(self, btn):
             if btn.get_active():
                 boot_enable(self.cfg)
+                self._managed = True
                 # o servico (enable --now) assume a rotacao: o processo
                 # local para para nao aplicar em duplicata
                 if self.cfg.get("rotate"):
                     self.rotator.stop()
             else:
                 boot_disable(self.cfg)
+                self._managed = False
                 # sem servico, a rotacao volta para dentro do app
                 if self.cfg.get("rotate"):
                     self.rotator.start()
@@ -1701,6 +1753,8 @@ def build_gui():
                 save_config(self.cfg)
 
             self._watch_folder(folder)
+            # re-sonda o systemd (o --boot do CLI pode ter mudado fora do app)
+            threading.Thread(target=self._boot_probe, daemon=True).start()
             self.load_web(keep_status=msg)
 
         def _watch_folder(self, folder):
