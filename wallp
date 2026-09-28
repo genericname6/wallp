@@ -968,10 +968,10 @@ def build_gui():
             self.add_controller(self.ctrl)
             self.connect("close-request", self.on_close)
 
-            if cfg.get("rotate"):
-                # a decisao (servico x processo) precisa do is-enabled, que
-                # bloqueia -- vai numa thread e volta por idle
-                threading.Thread(target=self._boot_probe, daemon=True).start()
+            # Converge em thread (is-enabled bloqueia): com boot:true e sem
+            # unit, instala. Roda sempre, nao so com rotate -- o checkbox do
+            # boot tem que refletir algo real mesmo com a rotacao desligada.
+            threading.Thread(target=self._boot_converge, daemon=True).start()
             self.sync_rotate_ui()
 
             self.load()
@@ -1070,6 +1070,18 @@ def build_gui():
             except Exception:  # noqa: BLE001
                 managed = False
             GLib.idle_add(self._boot_probed, managed)
+
+        def _boot_converge(self):
+            """O flag manda: com boot:true e sem unit, instala. Só convergir
+            para INSTALAR, nunca para remover sozinho -- remover continua
+            sendo ato explicito (checkbox, CLI). Com o daemon obedecendo o
+            flag, uma unidade orfa com flag desligado e inofensiva."""
+            try:
+                if self.cfg.get("boot") and boot_status() != "enabled":
+                    boot_enable(self.cfg)
+            except Exception:  # noqa: BLE001
+                pass
+            self._boot_probe()
 
         def _boot_probed(self, managed):
             self._managed = managed
