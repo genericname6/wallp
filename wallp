@@ -691,15 +691,23 @@ def build_gui():
             self.set_child(box)
 
     class GridCell(Gtk.Overlay):
-        """Celula da grade: so a imagem em 9:21, com o badge sobreposto.
+        """Celula da grade: so a imagem em 21:9, com o badge sobreposto.
 
         E um Overlay (nao um Box) pra nao aninhar: assim o Picture e o filho
         direto e o tamanho pedido cai na imagem, que e o que importa.
+
+        A celula tem hexpand e SEM largura minima: a largura vem da divisao
+        igual do viewport entre as colunas. Foi assim que a janela destravou:
+        o set_size_request(cw, ...) antigo criava um min-width de ~1350px
+        que o ScrolledWindow propagava (mesmo com hscroll=NEVER) e a janela
+        nao encolhia abaixo disso -- arrastar para dentro nao fazia nada.
+        A altura continua fixa em ch, que o resize_grid calcula da largura.
         """
 
         def __init__(self, pixbuf, badge):
             super().__init__()
             self.item = None
+            self.set_hexpand(True)
 
             self.img = Gtk.Picture()
             if (tex := paintable(pixbuf)) is not None:
@@ -817,6 +825,11 @@ def build_gui():
             # nesta versao do PyGObject, e um Grid fixo de 5 colunas e mais
             # simples e leve -- a lista cabe na tela sem rolagem propria.
             self.grid = Gtk.Grid(column_spacing=6, row_spacing=6)
+            # valign START e nao FILL: com FILL a grade esticava para
+            # preencher o viewport e o GtkGrid distribuia o excedente entre
+            # as fileiras -- celula pedida com 63px de altura era alocada
+            # com 88px, e o 21:9 calculado nunca aparecia na tela
+            self.grid.set_valign(Gtk.Align.START)
             self.grid.set_hexpand(True)
             gridcl = Gtk.GestureClick()
             gridcl.set_button(1)
@@ -1312,7 +1325,11 @@ def build_gui():
                 if all(c.get_parent() is self.grid for c in self.grid_items):
                     return ncols, int(cw), ch
             for cell in self.grid_items:
-                cell.set_size_request(int(cw), ch)
+                # so altura, sem largura: a largura vem do hexpand (divisao
+                # igual do viewport). Com largura minima a grade pedia
+                # ~1350px de min-width, o ScrolledWindow propagava e a janela
+                # nao encolhia -- ver GridCell.
+                cell.set_size_request(-1, ch)
             self._ncols = ncols
             self._cell_geom = (ncols, int(cw), ch)
             self._laid_out = n
