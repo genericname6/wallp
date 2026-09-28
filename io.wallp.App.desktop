@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=wallp
+GenericName=Wallpaper
+Comment=Wallpaper com rotação automática (GNOME)
+Exec=wallp
+Icon=io.wallp.App
+Terminal=false
+Categories=Utility;GTK;GNOME;
+Keywords=wallpaper;background;wallhaven;rotacao;
+StartupNotify=true

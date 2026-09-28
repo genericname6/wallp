@@ -1,0 +1,1396 @@
+#!/usr/bin/env python3
+"""
+wallp - wallpaper para GNOME/Wayland (Arch), com rotacao automatica.
+
+FONTES (nessa ordem de prioridade na lista):
+  1. imagens da pasta apontada no topo  (local, tem prioridade)
+  2. wallhaven.cc via API key            (apenas nsfw + sketchy)
+
+ROTACAO AUTOMATICA:
+  usa SO a pasta apontada. nada de rede, nada de download.
+  - dentro do app: continua rodando com a janela fechada
+  - no boot:      `wallp --boot on` instala um unit do systemd --user
+
+O filtro `purity` da API do wallhaven esta quebrado (ignora o parametro e
+devolve o mesmo lote para qualquer valor), entao a garantia de 18+ e feita
+aqui no cliente, conferindo o campo `purity` de cada wallpaper.
+
+Modos:
+  wallp              janela (lista ou grade)
+  wallp --rotate     so a rotacao, sem janela, para o systemd
+"""
+
+import concurrent.futures
+import json
+import math
+import os
+
+# o renderer padrao do GTK4 aqui cai em llvmpipe (sem DRI3) e come ~18 MB a mais
+# so na hora de desenhar. precisa ser definido ANTES de importar o Gtk.
+os.environ.setdefault("GSK_RENDERER", "cairo")
+
+import pathlib
+import subprocess
+import sys
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import gi
+from gi.repository import GLib  # GLib e leve (27 MB) e serve p/ modo headless
+
+# Gtk/Gdk/GdkPixbuf sao ~200 MB. ficam carregados so quando ha janela de fato,
+# para o daemon do systemd rodar nos ~27 MB do GLib.
+
+APP_ID = "io.wallp.App"
+API = "https://wallhaven.cc/api/v1/search"
+THUMB = "https://th.wallhaven.cc/small/{p}/{i}.jpg"
+
+PURITY_18PLUS = ("nsfw", "sketchy")
+PURITY_PEDIDO = ("nsfw", "sketchy")
+
+IMG_EXT = (".jpg", ".jpeg", ".png", ".webp", ".jxl", ".bmp", ".gif", ".tif", ".tiff")
+THUMB_W, THUMB_H = 96, 96
+
+ICON_NAME = "io.wallp.App"   # ~/.local/share/icons/hicolor/scalable/apps/
+
+# celula da grade: 21 de LARGURA por 9 de ALTURA (paisagem/ultrawide, mais larga
+# que alta). 21/9 = 2.33.
+GRID_RATIO = 21 / 9
+GRID_CELL_MAX = 420    # largura maxima da celula
+GRID_CELL_MIN = 140    # abaixo disso a celula fica inutil
+GRID_COLS_MAX = 6      # teto de colunas
+GRID_COLS_DEFAULT = 4  # usado antes do primeiro resize
+
+CONFIG_DIR = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "wallp"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+CACHE_DIR = pathlib.Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser() / "wallp"
+UNIT_DIR = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "systemd/user"
+UNIT_FILE = UNIT_DIR / "wallp.service"
+
+# pool limitado: uma thread por item daria ~130 conexoes simultaneas contra o
+# CDN, o que pesa a maquina e nao e educado com o servidor. 6 e o suficiente.
+POOL = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="wallp-thumb")
+
+CSS = b"""
+.tr { font-weight: bold; font-size: 1.05em; padding: 10px 4px 2px 4px; }
+.bd { font-size: 0.75em; padding: 1px 6px; border-radius: 9px; color: #111; }
+.nsfw { background: #e0555f; }
+.sk { background: #e0b23f; }
+.st { padding: 2px 6px; font-size: 0.85em; }
+.gridcell { margin: 2px; }
+/* o relogio usa currentColor: sem isso some no tema claro */
+.clock { color: inherit; }
+"""
+
+
+# --------------------------------------------------------------------------- config
+
+DEFAULT_CFG = {
+    "folder": "",
+    "key": "",
+    "rotate": False,
+    "interval": 300,   # segundos
+    "unit": "s",       # "s" | "min" (so como o valor e mostrado)
+    "view": "list",    # "list" | "grid"
+    "boot": False,
+}
+
+
+def load_config():
+    cfg = dict(DEFAULT_CFG)
+    try:
+        cfg.update(json.loads(CONFIG_FILE.read_text()))
+    except (OSError, ValueError):
+        pass
+    if env := os.environ.get("WALLP_KEY"):
+        cfg["key"] = env
+    return cfg
+
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n")
+    CONFIG_FILE.chmod(0o600)  # a key mora aqui
+
+
+# --------------------------------------------------------------------------- fontes
+
+def scan_folder(folder):
+    """Imagens da pasta local, ordenadas. [] se nao houver."""
+    p = pathlib.Path(folder).expanduser()
+    if not p.is_dir():
+        return []
+    try:
+        return sorted(f for f in p.iterdir() if f.is_file() and f.suffix.lower() in IMG_EXT)
+    except OSError:
+        return []
+
+
+def fetch_web(key, timeout=20):
+    """Busca wallpapers 18+ e filtra no cliente. Um pedido por tier, mesclados."""
+    if not key:
+        raise RuntimeError("sem API key (wallp --key, ou WALLP_KEY)")
+    vistos, out = set(), []
+
+    def get(tier):
+        qs = urllib.parse.urlencode(
+            {"purity": tier, "sorting": "random", "apikey": key}
+        )
+        req = urllib.request.Request(f"{API}?{qs}", headers={"User-Agent": "wallp/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read()).get("data") or []
+
+    def collect(items):
+        for w in items:
+            wid = w.get("id")
+            if not wid or wid in vistos:
+                continue
+            if w.get("purity") not in PURITY_18PLUS:  # filtro 18+ real
+                continue
+            vistos.add(wid)
+            out.append(w)
+
+    for tier in PURITY_PEDIDO:
+        try:
+            collect(get(tier))
+        except (urllib.error.URLError, ValueError, TimeoutError):
+            continue
+    return out
+
+
+def thumb_path(w):
+    return CACHE_DIR / f"{w['id']}.jpg"
+
+
+def local_thumb_path(f):
+    """Cache em disco da miniatura local, invalido por mtime+bytes.
+
+    Decodificar as 29 imagens da pasta mede 7,1 s (sao PNG de ate 15 MB /
+    5120x2880). Guardar a versao 96px como JPEG faz a segunda abertura ser
+    quase instantanea, sem depender de o PNG continuar no mesmo lugar.
+    """
+    try:
+        st = f.stat()
+        key = f"{f.stat().st_mtime_ns}-{st.st_size}"
+    except OSError:
+        return None
+    h = __import__("hashlib").sha1(
+        (str(f) + key).encode("utf-8", "replace")).hexdigest()[:20]
+    return CACHE_DIR / "local" / f"{h}.jpg"
+
+
+def fetch_thumb(w):
+    dest = thumb_path(w)
+    if dest.exists() and dest.stat().st_size > 1000:
+        return dest
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    wid = w["id"]
+    url = THUMB.format(p=wid[:2], i=wid)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "wallp/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            dest.write_bytes(r.read())
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+    return dest
+
+
+def fetch_full(w):
+    dest = CACHE_DIR / f"{w['id']}{pathlib.Path(w['path']).suffix}"
+    if dest.exists() and dest.stat().st_size > 1000:
+        return dest
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    req = urllib.request.Request(
+        w["path"], headers={"User-Agent": "wallp/1.0", "Referer": "https://wallhaven.cc/"}
+    )
+    with urllib.request.urlopen(req, timeout=180) as r:
+        dest.write_bytes(r.read())
+    return dest
+
+
+# --------------------------------------------------------------------------- aplicar
+
+def set_wallpaper(path):
+    """Aplica no GNOME (claro e escuro). Nao mexe em picture-options."""
+    uri = pathlib.Path(path).resolve().as_uri()
+    for key in ("picture-uri", "picture-uri-dark"):
+        subprocess.run(
+            ["gsettings", "set", "org.gnome.desktop.background", key, uri],
+            check=True, capture_output=True,
+        )
+
+
+# --------------------------------------------------------------------------- rotacao
+
+def human_time(sec):
+    sec = max(0, int(sec))
+    m, s = divmod(sec, 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+class Rotator:
+    """Troca o wallpaper da pasta a cada N segundos. So a pasta -- nada de rede.
+
+    Quando `interval <= 0` nao agenda nada: a unica troca e a do proximo(),
+    feita na mao. Isso mantem o timer do GLib sem dangling em uso manual.
+    """
+
+    def __init__(self, folder, interval, on_apply=None, on_tick=None):
+        self.folder = folder
+        self.interval = max(0, int(interval))
+        self.on_apply = on_apply
+        self.on_tick = on_tick
+        self.files = []
+        self.index = -1
+        self.active = False
+        self.remaining = 0
+        self._tid = None
+
+    # -- estado ------------------------------------------------------------
+    def available(self):
+        return bool(self.files)
+
+    def current(self):
+        return self.files[self.index] if 0 <= self.index < len(self.files) else None
+
+    def next_name(self):
+        if not self.files:
+            return None
+        return self.files[(self.index + 1) % len(self.files)].name
+
+    def rescan(self):
+        self.files = scan_folder(self.folder)
+
+    # -- controle ----------------------------------------------------------
+    def set_interval(self, sec):
+        self.interval = max(0, int(sec))
+        if self.active:
+            self.restart_timer()
+
+    def start(self):
+        self.rescan()
+        if not self.files:
+            return False
+        self.active = True
+        self.restart_timer()
+        return True
+
+    def stop(self):
+        self.active = False
+        self.cancel_timer()
+        self.remaining = 0
+        self._emit_tick()
+
+    def toggle(self):
+        if self.active:
+            self.stop()
+            return False
+        return self.start()
+
+    def cancel_timer(self):
+        if self._tid is not None:
+            GLib.source_remove(self._tid)
+            self._tid = None
+
+    def restart_timer(self):
+        self.cancel_timer()
+        if not self.active or self.interval <= 0:
+            return
+        self.remaining = self.interval
+        self._tid = GLib.timeout_add_seconds(1, self._tick)
+        self._emit_tick()
+
+    # -- laco --------------------------------------------------------------
+    def _tick(self):
+        self.remaining -= 1
+        if self.remaining <= 0:
+            self.remaining = self.interval if self.interval > 0 else 0
+            self.advance()
+        self._emit_tick()
+        return self.active and self.interval > 0
+
+    def _emit_tick(self):
+        if self.on_tick:
+            self.on_tick(self)
+
+    def advance(self):
+        """Aplica o proximo da pasta. Devolve o nome aplicado, ou None."""
+        if not self.files:
+            return None
+        self.index = (self.index + 1) % len(self.files)
+        f = self.files[self.index]
+        try:
+            set_wallpaper(f)
+        except (subprocess.CalledProcessError, OSError):
+            return None
+        if self.on_apply:
+            self.on_apply(f)
+        return f.name
+
+    def next(self):
+        """Troca manual: resorteia a lista e aplica."""
+        if self.active:
+            self.restart_timer()
+        return self.advance()
+
+
+# --------------------------------------------------------------------------- systemd
+
+UNIT = """[Unit]
+Description=wallp - rotacao automatica de wallpaper
+Documentation=file://%h/.local/share/wallp/README.md
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wallp --rotate
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def boot_enable(cfg):
+    UNIT_DIR.mkdir(parents=True, exist_ok=True)
+    UNIT_FILE.write_text(UNIT)
+    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    subprocess.run(["systemctl", "--user", "enable", "--now", "wallp.service"],
+                   capture_output=True)
+    # linger faz o service subir no boot mesmo sem sessao grafica aberta
+    subprocess.run(["loginctl", "enable-linger", os.environ.get("USER", "")],
+                   capture_output=True)
+    cfg["boot"] = True
+    save_config(cfg)
+    return True
+
+
+def boot_disable(cfg):
+    subprocess.run(["systemctl", "--user", "disable", "--now", "wallp.service"],
+                   capture_output=True)
+    try:
+        UNIT_FILE.unlink()
+    except OSError:
+        pass
+    cfg["boot"] = False
+    save_config(cfg)
+    return True
+
+
+def boot_status():
+    r = subprocess.run(["systemctl", "--user", "is-enabled", "wallp.service"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() or "desconhecido"
+
+
+# --------------------------------------------------------------------------- modo headless
+
+def run_headless(cfg):
+    """Sem janela, sem Gtk: daemon de rotacao (~27 MB)."""
+    rot = Rotator(cfg["folder"], cfg["interval"])
+    rot.rescan()
+    if not rot.files:
+        print(f"wallp: pasta sem imagens: {cfg['folder'] or '(vazia)'}", file=sys.stderr)
+        return 1
+    print(f"wallp: rotando {len(rot.files)} imagens de {cfg['folder']} "
+          f"a cada {human_time(rot.interval)}")
+
+    def on_apply(f):
+        print(f"  -> {f.name}")
+
+    rot.on_apply = on_apply
+    rot.start()
+    GLib.MainLoop().run()
+    return 0
+
+
+# --------------------------------------------------------------------------- GUI
+
+def build_gui():
+    """Carrega o Gtk e define as classes da janela. Chamado so com interface."""
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import Gdk, GdkPixbuf, Gtk  # noqa: E402
+
+    def paintable(pb):
+        if pb is None:
+            return None
+        try:
+            return Gdk.Texture.new_for_pixbuf(pb)
+        except GLib.Error:
+            return None
+
+    def pad(w, top=0, bottom=0, start=0, end=0):
+        w.set_margin_top(top)
+        w.set_margin_bottom(bottom)
+        w.set_margin_start(start)
+        w.set_margin_end(end)
+        return w
+
+    class ClockIcon(Gtk.DrawingArea):
+        """Relogio de verdade: circulo, 12 marcas e um ponteiro que gira.
+
+        O ponteiro completa uma volta por intervalo de rotacao -- assim ele
+        mostra o progresso da contagem, em vez de girar sem relacao com nada.
+        """
+
+        def __init__(self, size=26):
+            super().__init__()
+            self.progress = 0.0
+            self.active = False
+            self.set_size_request(size, size)
+            self.add_css_class("clock")
+            self.set_draw_func(self._draw)
+
+        def set_state(self, active, progress=0.0):
+            self.active = active
+            self.progress = progress
+            self.queue_draw()
+
+        def clock_color(self, ctx):
+            """Cor real do widget, para o relogio existir em qualquer tema.
+
+            Gtk.Widget.get_color() devolve o foreground e respeita o tema
+            claro e o escuro. lookup_color() esta deprecado. O nome e
+            clock_color, e nao get_color, para nao colidir com a API.
+            """
+            try:
+                rgba = Gtk.Widget.get_color(self, ctx)
+                if rgba is not None:
+                    return (rgba.red, rgba.green, rgba.blue)
+            except Exception:  # noqa: BLE001
+                pass
+            return (0.13, 0.13, 0.13)   # fallback: quase preto (tema claro)
+
+        def _draw(self, area, ctx, w, h):
+            # A cor vem do CSS do widget (color: currentColor) e nao branco
+            # fixo: no tema claro do GNOME o branco sumia no fundo branco.
+            col = self.clock_color(ctx)
+            cx, cy, r = w / 2, h / 2, min(w, h) / 2 - 1.5
+            dim = 0.45 if not self.active else 1.0
+
+            ctx.set_line_width(1.3)
+            ctx.set_source_rgba(*col, 0.75 * dim)
+            ctx.arc(cx, cy, r, 0, 2 * math.pi)
+            ctx.stroke()
+
+            for i in range(12):
+                a = i * math.pi / 6 - math.pi / 2
+                inner = r * (0.80 if i % 3 == 0 else 0.88)
+                ctx.set_line_width(1.5 if i % 3 == 0 else 1.0)
+                ctx.move_to(cx + inner * math.cos(a), cy + inner * math.sin(a))
+                ctx.line_to(cx + r * 0.97 * math.cos(a), cy + r * 0.97 * math.sin(a))
+            ctx.stroke()
+
+            ang = self.progress * 2 * math.pi - math.pi / 2
+            ctx.set_line_width(2.0)
+            ctx.set_source_rgba(*col, 0.95 if self.active else 0.55)
+            ctx.move_to(cx, cy)
+            ctx.line_to(cx + r * 0.72 * math.cos(ang), cy + r * 0.72 * math.sin(ang))
+            ctx.stroke()
+            ctx.arc(cx, cy, 1.6, 0, 2 * math.pi)
+            ctx.fill()
+
+    class Row(Gtk.ListBoxRow):
+        """Linha da lista. O item fica em .item."""
+
+        def __init__(self, pixbuf, title, subtitle, badge):
+            super().__init__()
+            self.item = None
+            self.set_activatable(True)
+
+            box = pad(Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12),
+                      top=6, bottom=6, start=8, end=8)
+
+            img = Gtk.Picture()
+            if (tex := paintable(pixbuf)) is not None:
+                img.set_paintable(tex)
+            img.set_content_fit(Gtk.ContentFit.COVER)
+            img.set_size_request(THUMB_W, THUMB_H)
+            img.add_css_class("card")
+            box.append(img)
+
+            txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            txt.set_hexpand(True)
+            txt.set_valign(Gtk.Align.CENTER)
+            lbl = Gtk.Label(label=title)
+            lbl.set_xalign(0)
+            lbl.set_ellipsize(3)
+            sub = Gtk.Label(label=subtitle)
+            sub.set_xalign(0)
+            sub.add_css_class("dim-label")
+            txt.append(lbl)
+            txt.append(sub)
+            box.append(txt)
+
+            if badge:
+                b = Gtk.Label(label=badge)
+                b.add_css_class("bd")
+                b.add_css_class(badge)
+                b.set_valign(Gtk.Align.CENTER)
+                box.append(b)
+
+            self.set_child(box)
+
+    class GridCell(Gtk.Overlay):
+        """Celula da grade: so a imagem em 9:21, com o badge sobreposto.
+
+        E um Overlay (nao um Box) pra nao aninhar: assim o Picture e o filho
+        direto e o tamanho pedido cai na imagem, que e o que importa.
+        """
+
+        def __init__(self, pixbuf, badge):
+            super().__init__()
+            self.item = None
+
+            self.img = Gtk.Picture()
+            if (tex := paintable(pixbuf)) is not None:
+                self.img.set_paintable(tex)
+            # COVER = preenche a celula toda e corta o excesso, sem distorcer
+            self.img.set_content_fit(Gtk.ContentFit.COVER)
+            self.img.set_can_shrink(True)
+            self.set_child(self.img)
+
+            if badge:
+                b = Gtk.Label(label=badge)
+                b.add_css_class("bd")
+                b.add_css_class(badge)
+                b.set_halign(Gtk.Align.END)
+                b.set_valign(Gtk.Align.START)
+                b.set_margin_top(4)
+                b.set_margin_end(4)
+                self.add_overlay(b)
+
+            self.add_css_class("gridcell")
+
+        def set_pixbuf(self, pb):
+            if (tex := paintable(pb)) is not None:
+                self.img.set_paintable(tex)
+
+    class Header(Gtk.ListBoxRow):
+        def __init__(self, text):
+            super().__init__()
+            self.set_activatable(False)
+            lbl = Gtk.Label(label=text)
+            lbl.set_xalign(0)
+            lbl.add_css_class("tr")
+            self.set_child(lbl)
+
+    class Win(Gtk.ApplicationWindow):
+        def __init__(self, app, cfg):
+            super().__init__(application=app, title="wallp")
+            self.cfg = cfg
+            self.set_default_size(600, 720)
+
+            prov = Gtk.CssProvider()
+            prov.load_from_data(CSS)
+            Gtk.StyleContext.add_provider_for_display(
+                self.get_display(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+            # ---------------- barra
+            hb = Gtk.HeaderBar()
+
+            self.view_btn = Gtk.ToggleButton(icon_name="view-grid-symbolic")
+            self.view_btn.set_tooltip_text("Alternar lista / grade (V)")
+            self.view_btn.set_active(cfg.get("view") == "grid")
+            self.view_btn.connect("toggled", self.on_view_toggle)
+            hb.pack_start(self.view_btn)
+
+            reload_btn = Gtk.Button(icon_name="view-refresh-symbolic")
+            reload_btn.set_tooltip_text("Sortear outros da web (R)")
+            reload_btn.connect("clicked", lambda *_: self.load_web())
+            hb.pack_end(reload_btn)
+
+            next_btn = Gtk.Button(icon_name="media-playback-start-symbolic")
+            next_btn.set_tooltip_text("Proximo wallpaper da pasta (N)")
+            next_btn.connect("clicked", lambda *_: self.on_next())
+            hb.pack_end(next_btn)
+
+            # o Rotator precisa existir ANTES do popover e do botao do relogio:
+            # _restore_interval() ja dispara on_interval_changed, que chama
+            # self.rotator.set_interval()
+            self.rotator = Rotator(
+                cfg["folder"], cfg["interval"],
+                on_apply=self.on_rotated, on_tick=self.on_rot_tick,
+            )
+            self.rotator.rescan()
+
+            # o relogio que gira
+            self.clock = ClockIcon()
+            self.clock_btn = Gtk.MenuButton()
+            self.clock_btn.set_child(self.clock)
+            self.clock_btn.set_tooltip_text("Rotacao automatica")
+            self.clock_btn.set_popover(self.build_popover())
+            hb.pack_end(self.clock_btn)
+
+            title = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            logo = Gtk.Image.new_from_icon_name(ICON_NAME)
+            logo.set_pixel_size(20)
+            title.append(logo)
+            title.append(Gtk.Label(label="wallp"))
+            hb.set_title_widget(title)
+            root.append(hb)
+
+            # ---------------- a unica opcao: caminho da pasta
+            top = pad(Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6),
+                      top=8, bottom=6, start=8, end=8)
+            top.append(Gtk.Label(label="Pasta"))
+            self.entry = Gtk.Entry(hexpand=True, placeholder_text="~/Imagens/wallpapers")
+            self.entry.set_text(cfg.get("folder", ""))
+            self.entry.connect("activate", lambda *_: self.load())
+            top.append(self.entry)
+            btn = Gtk.Button(label="Abrir")
+            btn.add_css_class("suggested-action")
+            btn.connect("clicked", lambda *_: self.load())
+            top.append(btn)
+            root.append(top)
+
+            # ---------------- lista e grade
+            self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+            self.listbox.add_css_class("boxed-list")
+            self.listbox.connect("row-activated", self.on_activate)
+
+            # Grid estatico (nao GridView): o GridView nao expoe append/remove
+            # nesta versao do PyGObject, e um Grid fixo de 5 colunas e mais
+            # simples e leve -- a lista cabe na tela sem rolagem propria.
+            self.grid = Gtk.Grid(column_spacing=6, row_spacing=6)
+            self.grid.set_hexpand(True)
+            gridcl = Gtk.GestureClick()
+            gridcl.set_button(1)
+            gridcl.connect("released", self.on_grid_click)
+            self.grid.add_controller(gridcl)
+
+            self.stack = Gtk.Stack()
+            self.stack.add_named(self.listbox, "list")
+            self.stack.add_named(self.grid, "grid")
+            self.stack.set_visible_child_name("grid" if cfg.get("view") == "grid" else "list")
+
+            margin = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            margin.set_margin_bottom(8)
+            margin.set_margin_start(8)
+            margin.set_margin_end(8)
+            self.scroll = Gtk.ScrolledWindow(vexpand=True)
+            self.scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            self.scroll.set_child(self.stack)
+            margin.append(self.scroll)
+            root.append(margin)
+
+            # ---------------- status
+            self.status = Gtk.Label(label="")
+            self.status.add_css_class("st")
+            self.status.set_margin_bottom(4)
+            root.append(self.status)
+
+            self.set_child(root)
+
+            self.rows = {}
+            self.grid_items = {}
+            self.web_refs = []   # (widget, container) so da web, p/ recarregar limpo
+            self._width = 0
+            self._tray = None
+            self._pending = []       # celulas ainda nao posicionadas
+            self._ncols = GRID_COLS_DEFAULT
+
+            self.ctrl = Gtk.EventControllerKey()
+            self.ctrl.connect("key-pressed", self.on_key)
+            self.add_controller(self.ctrl)
+            self.connect("close-request", self.on_close)
+
+            if cfg.get("rotate"):
+                self.rotator.start()
+            self.sync_rotate_ui()
+
+            self.load()
+
+        # ---------------- popup do relogio
+        def build_popover(self):
+            pop = Gtk.Popover()
+
+            box = pad(Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8),
+                      top=12, bottom=12, start=12, end=12)
+
+            self.chk_rotate = Gtk.CheckButton(label="Trocar automaticamente")
+            self.chk_rotate.connect("toggled", self.on_rotate_toggle)
+            box.append(self.chk_rotate)
+
+            # ---- o "time" abaixo da checkbox
+            tbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            tbox.set_margin_start(24)
+            self.spin = Gtk.SpinButton.new_with_range(1, 1440, 1)
+            self.spin.set_numeric(True)
+            self.spin.set_width_chars(5)
+            self.unit_dd = Gtk.DropDown.new_from_strings(["segundos", "minutos"])
+            self.unit_dd.set_halign(Gtk.Align.START)
+            self.spin.connect("value-changed", self.on_interval_changed)
+            self.unit_dd.connect("notify::selected", self.on_interval_changed)
+            tbox.append(Gtk.Label(label="a cada"))
+            tbox.append(self.spin)
+            tbox.append(self.unit_dd)
+            box.append(tbox)
+
+            self.countdown = Gtk.Label(label="")
+            self.countdown.add_css_class("dim-label")
+            self.countdown.set_margin_start(24)
+            box.append(self.countdown)
+
+            self.rot_info = Gtk.Label(label="")
+            self.rot_info.add_css_class("dim-label")
+            self.rot_info.set_margin_start(24)
+            self.rot_info.set_xalign(0)
+            box.append(self.rot_info)
+
+            sep = Gtk.Separator()
+            sep.set_margin_top(4)
+            box.append(sep)
+
+            self.chk_boot = Gtk.CheckButton(label="Iniciar no boot (systemd)")
+            self.chk_boot.connect("toggled", self.on_boot_toggle)
+            box.append(self.chk_boot)
+
+            hint = Gtk.Label(label="a bandeja precisa da extensao AppIndicator;\n"
+                                  "sem ela, rode  wallp  para reabrir")
+            hint.add_css_class("dim-label")
+            hint.set_margin_top(4)
+            box.append(hint)
+
+            pop.set_child(box)
+            self._restore_interval()
+            return pop
+
+        def _restore_interval(self):
+            unit = self.cfg.get("unit", "s")
+            iv = self.cfg.get("interval", 300)
+            if unit == "min":
+                self.unit_dd.set_selected(1)
+                self.spin.set_value(max(1, iv // 60))
+            else:
+                self.unit_dd.set_selected(0)
+                self.spin.set_value(max(1, min(iv, 1440)))
+
+        # ---------------- status / sync
+        def say(self, msg, warn=False):
+            self.status.set_label(msg)
+            self.status.remove_css_class("warning")
+            if warn:
+                self.status.add_css_class("warning")
+
+        def sync_rotate_ui(self):
+            on = self.rotator.active
+            self.chk_rotate.set_active(on)
+            self.chk_boot.set_active(bool(self.cfg.get("boot")))
+            self.chk_rotate.set_sensitive(self.rotator.available())
+            n = len(self.rotator.files)
+            if n:
+                self.rot_info.set_text(f"{n} imagem(ns) na pasta · proxima: "
+                                       f"{self.rotator.next_name() or '-'}")
+            else:
+                self.rot_info.set_text("pasta sem imagens: nada para rotacionar")
+            self.on_rot_tick(self.rotator)
+
+        def on_rot_tick(self, rot):
+            if rot.active and rot.interval > 0:
+                prog = 1 - (rot.remaining / rot.interval)
+                self.clock.set_state(True, prog)
+                self.countdown.set_text(f"proxima em {human_time(rot.remaining)}")
+            elif rot.active:
+                self.clock.set_state(True, 0.0)
+                self.countdown.set_text("intervalo 0: aplica na mao (N)")
+            else:
+                self.clock.set_state(False, 0.0)
+                self.countdown.set_text("rotacao parada")
+
+        def on_rotated(self, f):
+            GLib.idle_add(self.say, f"rotado: {f.name}")
+            GLib.idle_add(self.sync_rotate_ui)
+
+        # ---------------- handlers
+        def on_rotate_toggle(self, btn):
+            if btn.get_active() != self.rotator.active:
+                self.rotator.toggle()
+            self.cfg["rotate"] = self.rotator.active
+            save_config(self.cfg)
+            self.sync_rotate_ui()
+
+        def on_interval_changed(self, *_):
+            v = self.spin.get_value()
+            secs = int(v * 60) if self.unit_dd.get_selected() == 1 else int(v)
+            self.cfg["interval"] = max(1, secs)
+            self.cfg["unit"] = "min" if self.unit_dd.get_selected() == 1 else "s"
+            save_config(self.cfg)
+            self.rotator.set_interval(max(1, secs))
+            self.on_rot_tick(self.rotator)
+
+        def on_boot_toggle(self, btn):
+            if btn.get_active():
+                boot_enable(self.cfg)
+            else:
+                boot_disable(self.cfg)
+            self.say(f"boot: {boot_status()}")
+
+        def on_next(self):
+            if not self.rotator.files:
+                self.say("pasta sem imagens", warn=True)
+                return
+            # atalho explicito de rotacao: nao desliga a rotacao
+            name = self.rotator.next()
+            self.say(f"aplicado: {name}" if name else "falhou", warn=name is None)
+
+        def on_view_toggle(self, btn):
+            mode = "grid" if btn.get_active() else "list"
+            if mode == self.stack.get_visible_child_name():
+                return
+            self.cfg["view"] = mode
+            save_config(self.cfg)
+            self.stack.set_visible_child_name(mode)   # rebuild le o modo novo
+            self.rebuild()
+
+        def rebuild(self):
+            """Redesenha tudo no container do modo atual.
+
+            Inverter o Stack sozinho nao move nada: cada item foi criado num
+            ListBox ou num Grid conforme o modo da hora. Entao juntamos tudo
+            Numa lista unica, limpamos e recriamos.
+
+            A ordem de exibicao e sempre local -> web, independente do modo.
+            """
+            # junta tudo sem repetir: o mesmo item pode estar em rows E em
+            # grid_items se algum caminho antigo nao limpou
+            merged, seen = [], set()
+            for src in (list(self.rows.values()) + list(self.grid_items.values())):
+                if id(src) not in seen:
+                    seen.add(id(src))
+                    merged.append(src)
+
+            ordered = ([i for i in merged if i["kind"] == "local"]
+                       + [i for i in merged if i["kind"] == "web"])
+
+            self.clear()
+            for it in ordered:
+                badge = it.get("badge") or None
+                if it["kind"] == "local":
+                    badge = None
+                self.add_item(self._pix_for(it), it.get("label", ""),
+                              it.get("sub", ""), badge, it)
+            if self.stack.get_visible_child_name() == "grid":
+                self.resize_grid()      # posiciona tudo de uma vez
+            return len(ordered)
+
+        def on_key(self, _c, keyval, _k, _m, _state=None):
+            if keyval in (ord("R"), ord("r")):
+                self.load_web()
+            elif keyval in (ord("V"), ord("v")):
+                self.view_btn.set_active(not self.view_btn.get_active())
+            elif keyval in (ord("N"), ord("n")):
+                self.on_next()
+            elif keyval == ord("q") and _m & 4:  # Ctrl+Q
+                self.quit_app()
+            else:
+                return False
+            return True
+
+        def quit_app(self):
+            self.rotator.stop()
+            if self._tray:
+                GLib.idle_add(self._tray.hide)
+            self.get_application().quit()
+
+        def on_close(self, *_):
+            # fechar esconde em vez de sair, para a rotacao continuar
+            if self.cfg.get("rotate") or self._tray:
+                self.say("fechado, mas a rotacao continua · rode  wallp  para reabrir")
+                self.set_visible(False)
+                self._show_tray()
+                return True
+            self.quit_app()
+            return False
+
+        # ---------------- bandeja
+        def _show_tray(self):
+            if not self._tray:
+                try:
+                    gi.require_version("AppIndicator3", "0.1")
+                    from gi.repository import AppIndicator3 as AI
+                except (ValueError, ImportError):
+                    return
+                # o mesmo icone colorido da janela; a bandeja cai no
+                # preferences-system-time-symbolic so se o SVG nao for encontrado
+                icon = ICON_NAME
+                if not Gtk.IconTheme.get_default().has_icon(icon):
+                    icon = "preferences-system-time-symbolic"
+                ind = AI.Indicator.new("wallp", icon,
+                                       AI.IndicatorCategory.APPLICATION_STATUS)
+                m = Gtk.Menu()
+                it = Gtk.MenuItem(label="Mostrar wallp")
+                it.connect("activate", lambda *_: self.get_application().activate())
+                m.append(it)
+                n = Gtk.MenuItem(label="Proximo wallpaper")
+                n.connect("activate", lambda *_: self.on_next())
+                m.append(n)
+                m.append(Gtk.SeparatorMenuItem())
+                c = Gtk.CheckMenuItem(label="Trocar automaticamente")
+                c.set_active(self.rotator.active)
+                c.connect("toggled", lambda w: (self.chk_rotate.set_active(w.get_active()), False)[1])
+                m.append(c)
+                m.append(Gtk.SeparatorMenuItem())
+                q = Gtk.MenuItem(label="Sair")
+                q.connect("activate", lambda *_: self.quit_app())
+                m.append(q)
+                m.show_all()
+                ind.set_menu(m)
+                self._tray = ind
+            self._tray.set_status("wallp")
+
+            # ---------------- lista / grade
+        def clear(self):
+            for row in self.rows:
+                self.listbox.remove(row)
+            for cell in self.grid_items:
+                self.grid.remove(cell)
+            self.rows.clear()
+            self.grid_items.clear()
+            self.web_refs.clear()
+            self._pending.clear()
+            self._ncols = GRID_COLS_DEFAULT
+
+        def _relayout(self):
+            """Posiciona as celulas pendentes em linhas de _ncols.
+
+            Como as colunas sao responsivas, nao da pra fixar a posicao no
+            attach: cada celula nova ou uma mudanca de largura tem que
+            reposicionar todas.
+            """
+            n = self._ncols
+            order = list(self.grid_items)          # ordem de insercao = ordem visual
+            for cell in self._pending:
+                if cell not in self.grid_items:
+                    continue
+                pos = order.index(cell)
+                self.grid.attach(cell, pos % n, pos // n, 1, 1)
+            self._pending.clear()
+
+        def clear_web(self):
+            """Remove so as celulas/linhas da web, preservando as locais."""
+            if not self.web_refs:
+                return
+            # na grade qualquer remocao desloca as posicoes: reconstroi
+            if self.stack.get_visible_child_name() == "grid":
+                self.rebuild()
+                return
+            for widget, _c in self.web_refs:
+                self.listbox.remove(widget)
+                self.rows.pop(widget, None)
+            self.web_refs.clear()
+
+        def add_header(self, text):
+            self.listbox.append(Header(text))
+
+        def add_item(self, pixbuf, title, subtitle, badge, item):
+            """Coloca o item no container visivel e o registra.
+
+            title/subtitle/badge sao guardados no proprio item para que o
+            rebuild (troca lista<->grade) nao perca o texto.
+            """
+            item["label"] = title
+            item["sub"] = subtitle
+            item["badge"] = badge
+            if pixbuf is not None:
+                item["_pb"] = pixbuf      # sobrevive a troca lista<->grade
+            if self.stack.get_visible_child_name() == "grid":
+                cell = GridCell(pixbuf, badge)
+                cell.item = item
+                self._pending.append(cell)      # posicionado no fim, por _relayout
+                self.grid_items[cell] = item
+                if item["kind"] == "web":
+                    self.web_refs.append((cell, self.grid))
+                return cell
+            row = Row(pixbuf, title, subtitle, badge)
+            row.item = item
+            self.listbox.append(row)
+            self.rows[row] = item
+            if item["kind"] == "web":
+                self.web_refs.append((row, self.listbox))
+            return row
+
+        def resize_grid(self):
+            """Celulas em 21:9 (mais larga que alta), colunas responsivas.
+
+            Primeiro decide quantas colunas cabem na largura, depois encolhe
+            a celula (em largura e altura, sempre no 21:9) ate caberem as
+            linhas que cabem na altura. Isso evita a rolagem enorme.
+            """
+            # a largura real da grade. usar self.scroll.get_width() dava o
+            # minimo do clamp (160) enquanto a janela nao estava alocada, e a
+            # grade ficava com 4 colunas de 124px num monitor de 1900px
+            avail_w = max(160, (self.get_width() or 0) - 40)
+            avail_h = max(120, (self.get_height() or 0) - 190)
+            n = len(self.grid_items)
+            if not n:
+                return 0, 0, 0
+
+            # Heuristica: usa a largura toda, mas sem celulas gigantes.
+            # Sobe de colunas enquanto a celula ficar grande o bastante para
+            # o wallpaper ser reconhecivel; a ultima coluna que cabe E a que
+            # vence. Com GRID_CELL_MAX como teto, para nao sobrar vao vazio.
+            ncols = 2
+            cw = (avail_w - 6) / 2
+            for c in range(2, GRID_COLS_MAX + 1):
+                cand = (avail_w - (c - 1) * 6) / c
+                if cand < GRID_CELL_MIN:
+                    break                       # pequena demais: para aqui
+                if cand > GRID_CELL_MAX:
+                    continue                    # ainda cabe mais gente
+                ncols, cw = c, cand
+            cw = min(cw, GRID_CELL_MAX)
+            # se a melhor celula ainda for enorme, preferimos 1 coluna a mais
+            # em vez de deixar metade da tela vazia
+            while ncols < GRID_COLS_MAX and cw > GRID_CELL_MAX:
+                ncols += 1
+                cw = min(cw, (avail_w - (ncols - 1) * 6) / ncols)
+            ch = int(cw / GRID_RATIO)
+
+            for cell in self.grid_items:
+                cell.set_size_request(int(cw), ch)
+            self._ncols = ncols
+            self._relayout()                      # reposiciona com o ncols novo
+            return ncols, int(cw), ch
+
+        # -- local
+        def load_local(self, folder):
+            files = scan_folder(folder)
+            if not files:
+                return 0
+            self.add_header(f"Local  ·  {len(files)} imagem(ns) em {folder}")
+            for f in files:
+                item = {"kind": "local", "path": str(f)}
+                pb = self._load_local(f)          # cache de disco; None = decodifica depois
+                if pb is not None:
+                    item["_pb"] = pb
+                else:
+                    POOL.submit(self._local_worker, f, item)
+                try:
+                    kb = f.stat().st_size // 1024
+                except OSError:
+                    kb = 0
+                self.add_item(pb, f.name, f"{kb} KB", None, item)
+            return len(files)
+
+        def _load_local(self, f):
+            """Miniatura local do cache em disco, ou None se ainda nao existe."""
+            p = local_thumb_path(f)
+            if p is None or not p.exists():
+                return None
+            try:
+                return GdkPixbuf.Pixbuf.new_from_file_at_scale(str(p), THUMB_W, THUMB_H, True)
+            except GLib.Error:
+                return None
+
+        def _local_worker(self, f, item):
+            """Decodifica fora da thread da UI e grava o cache de disco."""
+            p = local_thumb_path(f)
+            pb = self._decode_local(f, p)
+            if pb is None:
+                return
+            GLib.idle_add(self._set_item_thumb, id(item), pb)
+
+        def _decode_local(self, f, dest):
+            """Abre a imagem local, com fallback quando o glycin recusa.
+
+            O glycin (loader do GNOME 50) falha em alguns PNGs 5120x2880 com
+            "InternalEditorError" -- 10 das 29 imagens da pasta. Nesses casos
+            o ImageMagick gera a miniatura, que e so 4 KB.
+            """
+            if dest is not None:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(f), THUMB_W, THUMB_H, True)
+                if dest is not None and not dest.exists():
+                    pb.savev(str(dest), "jpeg", [], [])
+                return pb
+            except GLib.Error:
+                pass
+
+            # fallback: imagem magick
+            if dest is None:
+                return None
+            tool = next((t for t in ("magick", "convert")
+                         if __import__("shutil").which(t)), None)
+            if not tool:
+                return None
+            try:
+                subprocess.run(
+                    [tool, str(f), "-resize", f"{THUMB_W}x{THUMB_H}", str(dest)],
+                    capture_output=True, timeout=60, check=True)
+            except (subprocess.SubprocessError, OSError):
+                return None
+            try:
+                return GdkPixbuf.Pixbuf.new_from_file_at_scale(str(dest), THUMB_W, THUMB_H, True)
+            except GLib.Error:
+                return None
+
+        # -- web
+        def load_web(self):
+            self.clear_web()
+            key = self.entry_key()
+            if not key:
+                self.say("sem API key: use  wallp --key <APIKEY>  ou  WALLP_KEY", warn=True)
+                return
+            self.say("buscando wallpapers 18+ no wallhaven...")
+            threading.Thread(target=self._web_worker, args=(key,), daemon=True).start()
+
+        def entry_key(self):
+            return load_config().get("key", "")
+
+        def _web_worker(self, key):
+            try:
+                GLib.idle_add(self._web_done, fetch_web(key), None)
+            except Exception as e:  # noqa: BLE001
+                GLib.idle_add(self._web_done, [], str(e))
+
+        def _web_done(self, data, err):
+            if err:
+                self.say(f"web: {err}", warn=True)
+                return False
+            if not data:
+                self.say("web: nenhum 18+ retornou", warn=True)
+                return False
+
+            if self.stack.get_visible_child_name() == "list":
+                self.add_header(f"Wallhaven 18+  ·  {len(data)} wallpaper(s)")
+            for w in data:
+                item = {"kind": "web", "w": w}
+                w["_item_ref"] = item          # o worker acha o item por ele
+                pb = self._load_thumb(w)
+                if pb is None:
+                    POOL.submit(self._thumb_worker, w)
+                self.add_item(pb, w["id"],
+                              f"{w.get('resolution', '?')} · {w.get('file_size', 0) // 1024} KB",
+                              w.get("purity", ""), item)
+            if self.stack.get_visible_child_name() == "grid":
+                self.resize_grid()
+            n_sfw = sum(1 for w in data if w["purity"] == "nsfw")
+            self.say(f"{len(data)} da web ({n_sfw} nsfw, {len(data) - n_sfw} sketchy)"
+                     f" · R sorteia · V troca a view")
+            return False
+
+        def _load_thumb(self, w):
+            tp = thumb_path(w)
+            if not tp.exists():
+                return None
+            try:
+                return GdkPixbuf.Pixbuf.new_from_file_at_scale(str(tp), THUMB_W, THUMB_H, True)
+            except GLib.Error:
+                return None
+
+        def _thumb_worker(self, w):
+            p = fetch_thumb(w)
+            if not p:
+                return
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(p), THUMB_W, THUMB_H, True)
+            except GLib.Error:
+                return
+            GLib.idle_add(self._set_item_thumb, id(w.get("_item_ref")), pb)
+
+        def _set_item_thumb(self, item_id, pb):
+            """Pinta a miniatura assim que ela chega, sem travar a UI."""
+            for widget, item in {**self.rows, **self.grid_items}.items():
+                if id(item) == item_id:
+                    item["_pb"] = pb
+                    if isinstance(widget, GridCell):
+                        widget.set_pixbuf(pb)
+                    else:
+                        widget.get_child().get_first_child().set_paintable(paintable(pb))
+                    break
+            return False
+
+        # -- acoes
+        def load(self):
+            folder = self.entry.get_text().strip()
+            self.cfg["folder"] = folder
+            save_config(self.cfg)
+            self.clear()
+
+            n_local = self.load_local(folder)
+            self.say(f"{n_local} local(is)" if n_local else "pasta vazia ou invalida: so a web")
+
+            self.rotator.folder = folder
+            self.rotator.rescan()
+            self.sync_rotate_ui()
+            if self.rotator.active and not self.rotator.files:
+                self.rotator.stop()
+                self.cfg["rotate"] = False
+                save_config(self.cfg)
+
+            self.load_web()
+
+        def on_activate(self, _lb, row):
+            if item := self.rows.get(row):
+                self.apply(item)
+
+        def on_grid_click(self, gesture, n_press, x, y):
+            if n_press != 1:
+                return
+            target = self.grid.pick(x, y, Gtk.PickFlags.DEFAULT)
+            if item := self.grid_items.get(target):
+                self.apply(item)
+
+        def _pix_for(self, item):
+            """Pixbuf do item. Fica preso ao proprio item, entao sobrevive a
+            varias trocas de lista<->grade.
+
+            Sem isso, cada clique redecodifica ~30 PNGs de ate 15 MB na thread
+            da UI: 7,2 s de congelamento medidos, agora ~0,03 s.
+            """
+            pb = item.get("_pb")
+            if pb is not None:
+                return pb
+            if item["kind"] == "local":
+                pb = self._load_local(pathlib.Path(item["path"]))
+                if pb is None:
+                    POOL.submit(self._local_worker, pathlib.Path(item["path"]), item)
+                    return None
+            else:
+                pb = self._load_thumb(item["w"])
+                if pb is None:
+                    POOL.submit(self._thumb_worker, item["w"])
+            if pb is not None:
+                item["_pb"] = pb
+            return pb
+
+        def apply(self, item):
+            # escolha manual tem prioridade: se a rotacao estava ligando, ela
+            # desliga de vez, senao o proximo tick sobrescreveria o clique
+            if self.rotator.active:
+                self.rotator.stop()
+                self.cfg["rotate"] = False
+                save_config(self.cfg)
+                self.sync_rotate_ui()
+                GLib.idle_add(self.say, "rotacao desligada (escolha manual)")
+            if item["kind"] == "local":
+                threading.Thread(target=self._apply_local, args=(item["path"],),
+                                 daemon=True).start()
+            else:
+                threading.Thread(target=self._apply_web, args=(item["w"],),
+                                 daemon=True).start()
+
+        def _apply_local(self, path):
+            GLib.idle_add(self.say, f"aplicado: {pathlib.Path(path).name}")
+            try:
+                set_wallpaper(path)
+            except (subprocess.CalledProcessError, OSError) as e:
+                GLib.idle_add(self.say, f"falhou: {e}", True)
+
+        def _apply_web(self, w):
+            GLib.idle_add(self.say, f"baixando {w['id']}...")
+            try:
+                dest = fetch_full(w)
+                GLib.idle_add(self.say, f"aplicado: {dest.name}")
+                set_wallpaper(dest)
+            except Exception as e:  # noqa: BLE001
+                GLib.idle_add(self.say, f"falhou: {e}", True)
+
+        def do_size_allocate(self, *a):  # noqa: N802
+            # recalcula quando a largura REAL da janela muda. medir o
+            # ScrolledWindow dava valor velho/temporario e a grade travava
+            # num tamanho errado (so 4 colunas num monitor largo)
+            if self.stack.get_visible_child_name() == "grid":
+                w = self.get_width()
+                if w and abs(w - self._width) > 8:
+                    self._width = w
+                    self.resize_grid()
+            Gtk.ApplicationWindow.do_size_allocate(self, *a)
+
+    return Win
+
+
+# --------------------------------------------------------------------------- main
+
+USAGE = """uso:
+  wallp                     abre a janela
+  wallp --rotate            so a rotacao, sem janela (para o systemd)
+  wallp --key <APIKEY>      grava a key em ~/.config/wallp/config.json (0600)
+  wallp --pasta <caminho>   grava a pasta
+  wallp --boot on|off       instala/desinstala a rotacao no boot
+  wallp --status            mostra o estado
+"""
+
+
+def main():
+    cfg = load_config()
+    argv = sys.argv[1:]
+
+    if "--help" in argv or "-h" in argv:
+        print(USAGE)
+        return 0
+
+    if "--rotate" in argv:
+        return run_headless(cfg)
+
+    if "--key" in argv:
+        i = argv.index("--key")
+        if i + 1 >= len(argv):
+            print(USAGE, file=sys.stderr)
+            return 2
+        cfg["key"] = argv[i + 1]
+        save_config(cfg)
+        print(f"key salva em {CONFIG_FILE} (0600)")
+        return 0
+
+    if "--pasta" in argv:
+        i = argv.index("--pasta")
+        if i + 1 >= len(argv):
+            print(USAGE, file=sys.stderr)
+            return 2
+        cfg["folder"] = argv[i + 1]
+        save_config(cfg)
+        print(f"pasta salva: {cfg['folder']}")
+        return 0
+
+    if "--boot" in argv:
+        i = argv.index("--boot")
+        if i + 1 >= len(argv) or argv[i + 1] not in ("on", "off"):
+            print(USAGE, file=sys.stderr)
+            return 2
+        boot_enable(cfg) if argv[i + 1] == "on" else boot_disable(cfg)
+        print(f"boot: {boot_status()}")
+        return 0
+
+    if "--status" in argv:
+        print(f"pasta     : {cfg['folder'] or '(vazia)'}")
+        print(f"imagens   : {len(scan_folder(cfg['folder']))}")
+        print(f"view      : {cfg['view']}")
+        print(f"rotacao   : {'ligada' if cfg['rotate'] else 'desligada'} "
+              f"a cada {human_time(cfg['interval'])}")
+        print(f"boot      : {boot_status()}")
+        print(f"key       : {'configurada' if cfg['key'] else 'ausente'}")
+        return 0
+
+    # ---- interface
+    Win = build_gui()
+    from gi.repository import Gtk  # so aqui que existe janela
+
+    app = Gtk.Application(application_id=APP_ID)
+    holder = {}
+
+    def on_activate(a):
+        nonlocal holder
+        if "win" not in holder:
+            holder["win"] = Win(a, cfg)
+        holder["win"].present()
+
+    app.connect("activate", on_activate)
+    return app.run([])
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

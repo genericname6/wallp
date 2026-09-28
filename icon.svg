@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  wallp - icone unico, colorido, usado na janela, na bandeja e no menu de apps.
+  viewBox 0 0 16 16 pra_AGGRESSIVAMENTE_ nao, o viewBox is 0 0 128 128 e o
+  tamanho e definido pelo chamador.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4a6cf7"/>
+      <stop offset="0.55" stop-color="#7b5cf0"/>
+      <stop offset="1" stop-color="#c04cd8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- ============================================================
+       CAMADA 1: a imagem (o wallpaper) - desenhada PRIMEIRO,
+       contida no quadrado arredondado, com tudo dentro dela.
+       ============================================================ -->
+  <g clip-path="url(#frame)">
+    <rect x="8" y="8" width="112" height="112" fill="url(#sky)"/>
+
+    <!-- sol -->
+    <circle cx="40" cy="37" r="10" fill="#fff8d6" opacity="0.95"/>
+
+    <!-- montanhas -->
+    <path d="M6 84 L32 52 L54 84 Z" fill="#ffffff" opacity="0.32"/>
+    <path d="M42 84 L72 44 L102 84 Z" fill="#ffffff" opacity="0.24"/>
+
+    <!-- chao -->
+    <rect x="6" y="84" width="116" height="40" fill="#1b1f3b" opacity="0.5"/>
+
+    <!-- brilho de cima -->
+    <rect x="8" y="8" width="112" height="56" fill="#ffffff" opacity="0.10"/>
+  </g>
+
+  <!-- ============================================================
+       CAMADA 2: a moldura, por cima, com o miolo transparente
+       (fill-rule evenodd recorta o centro) -> a moldura e um anel.
+       ============================================================ -->
+  <path fill-rule="evenodd" fill="#0f1220" fill-opacity="0.92"
+        d="M8 8 h112 a12 12 0 0 1 12 12 v88 a12 12 0 0 1 -12 12 h-112
+           a12 12 0 0 1 -12 -12 v-88 a12 12 0 0 1 12 -12 z
+           M18 18 v92 h92 v-92 z"/>
+
+  <!-- ============================================================
+       CAMADA 3: o relogio, dentro da moldura no canto inferior
+       direito. Alinhado a uma das picas do gradiente: o centro
+       do mostrador em (100,100), que e 8px do canto interno.
+       ============================================================ -->
+  <g transform="translate(100 100)">
+    <circle r="22" fill="#141a30"/>
+    <circle r="22" fill="none" stroke="#ffffff" stroke-opacity="0.30" stroke-width="2.5"/>
+    <g stroke="#ffffff" stroke-linecap="round" stroke-opacity="0.9">
+      <line x1="0"  y1="-16" x2="0"  y2="-11" stroke-width="3.5"/>
+      <line x1="0"  y1="16"  x2="0"  y2="11"  stroke-width="3.5"/>
+      <line x1="16" y1="0"   x2="11" y2="0"   stroke-width="3.5"/>
+      <line x1="-16" y1="0"  x2="-11" y2="0"  stroke-width="3.5"/>
+    </g>
+    <!-- ponteiro, "parado" em 1:30 -->
+    <line x1="0" y1="0" x2="11" y2="-11" stroke="#ffd166" stroke-width="4.5" stroke-linecap="round"/>
+    <circle r="2.8" fill="#ffd166"/>
+  </g>
+
+  <defs>
+    <clipPath id="frame">
+      <rect x="8" y="8" width="112" height="112" rx="12"/>
+    </clipPath>
+  </defs>
+</svg>
