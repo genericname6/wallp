@@ -950,10 +950,6 @@ def build_gui():
             self._ctx_item = None     # item do menu de botao direito
             self._pop = None          # popover do menu, para nao perder a ref
 
-            act = Gio.SimpleAction.new("download", None)
-            act.connect("activate", lambda *_: self.on_download_action())
-            self.add_action(act)
-
             self.ctrl = Gtk.EventControllerKey()
             self.ctrl.connect("key-pressed", self.on_key)
             self.add_controller(self.ctrl)
@@ -1710,15 +1706,25 @@ def build_gui():
                 self.show_ctx_menu(self.listbox, x, y, item)
 
         def show_ctx_menu(self, widget, x, y, item):
-            """Menu de botao direito. So abre nos itens da web."""
+            """Menu de botao direito. So abre nos itens da web.
+
+            E um Popover comum com um Button ligado direto, de proposito:
+            a versao anterior usava PopoverMenu+Gio.Menu, e a ligacao
+            modelo->botao falhava em silencio (action-name None no
+            GtkModelButton) -- o item aparecia sensivel, o clique nao
+            disparava nada, sem erro nenhum. Aqui nao ha despacho de acao.
+            """
             if item.get("kind") != "web":
                 _trace("MENU: item local, sem menu (esperado)")
                 return
             _trace(f"MENU abrindo id={item['w']['id']}")
             self._ctx_item = item
-            menu = Gio.Menu()
-            menu.append("Baixar para a pasta", "win.download")
-            pop = Gtk.PopoverMenu.new_from_model(menu)
+            self._close_pop()
+            pop = Gtk.Popover()
+            btn = Gtk.Button(label="Baixar para a pasta")
+            btn.connect("clicked",
+                        lambda _b: (pop.popdown(), self.on_download_action()))
+            pop.set_child(btn)
             pop.set_parent(widget)
             # Gdk.Rectangle() ignora argumentos no construtor (vira 0,0,0,0
             # e o menu abria no lugar errado): preenche campo a campo
@@ -1728,6 +1734,14 @@ def build_gui():
             pop.connect("closed", lambda p: p.unparent())
             self._pop = pop
             pop.popup()
+
+        def _close_pop(self):
+            if self._pop is not None:
+                try:
+                    self._pop.popdown()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._pop = None
 
         def _pix_for(self, item):
             """Pixbuf do item. Fica preso ao proprio item, entao sobrevive a
