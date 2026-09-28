@@ -875,7 +875,6 @@ def build_gui():
             # (a tecla R continua sorteando a web) para nao ter dois ↻.
             btn = Gtk.Button(icon_name="view-refresh-symbolic")
             btn.set_tooltip_text("Recarregar (pasta + web)")
-            btn.add_css_class("suggested-action")
             btn.connect("clicked", lambda *_: self.load())
             title.append(btn)
             # busca na web: mesmo formato de exibicao, filtra pelo termo.
