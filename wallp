@@ -61,6 +61,10 @@ IMG_EXT = (".jpg", ".jpeg", ".png", ".webp", ".jxl", ".bmp", ".gif", ".tif", ".t
 DECODE_W, DECODE_H = 384, 216
 THUMB_W, THUMB_H = 96, 96
 
+# Padrao embutido (ver load_config para o aviso): instalacao limpa usa
+# esta key sem precisar digitar. E a key do dono, decisao dele.
+DEFAULT_KEY = "cI4RlXgEt9ehvo2RAQ3R050KxBreT3Ho"
+
 ICON_NAME = "io.wallp.App"   # ~/.local/share/icons/hicolor/scalable/apps/
 
 
@@ -182,6 +186,13 @@ def load_config():
     if env := os.environ.get("WALLP_KEY"):
         cfg["key"] = env
         cfg["_key_from_env"] = True
+    # padrao embutido: instalacao limpa funciona sem digitar nada. ATENCAO:
+    # este arquivo e publico no GitHub, entao esta key e visivel para
+    # qualquer um que clonar. Se um dia ela vazar em abuso (throttle,
+    # revogacao), regenere em wallhaven.cc/account/settings/api e troque
+    # aqui + no config. Decisao consciente do dono, nao descuido.
+    if not cfg["key"]:
+        cfg["key"] = DEFAULT_KEY
     return cfg
 
 
