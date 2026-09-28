@@ -123,7 +123,7 @@ POOL = DaemonPool(n=6)
 CSS = b"""
 .bd { font-size: 0.75em; padding: 1px 6px; border-radius: 9px; color: #111; }
 .nsfw { background: #e0555f; }
-.sk { background: #e0b23f; }
+.sketchy { background: #e0b23f; }
 .st { padding: 2px 6px; font-size: 0.85em; }
 .gridcell { margin: 2px; }
 /* o relogio usa currentColor: sem isso some no tema claro */
