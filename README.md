@@ -59,6 +59,10 @@ primeiro, a web (com etiqueta `nsfw`/`sketchy`) depois.
 o original na pasta do topo (ou `~/Pictures/wallpapers`, criada se preciso)
 e o arquivo entra na grade na hora.
 
+**Busca na web**: o campo ao lado da pasta filtra por termo (Enter busca,
+limpar + Enter volta ao aleatório). O R respeita a busca ativa. O filtro
+18+ continua valendo, então o lote pode vir menor.
+
 ## O filtro 18+
 
 O parâmetro `purity` da API do wallhaven **está quebrado**: devolve o mesmo

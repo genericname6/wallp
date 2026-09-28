@@ -229,7 +229,7 @@ def scan_folder(folder):
         return []
 
 
-def fetch_web(key, timeout=20):
+def fetch_web(key, timeout=20, query=""):
     """Busca wallpapers 18+ e filtra no cliente. Um pedido por tier, mesclados."""
     if not key:
         raise RuntimeError("sem API key (wallp --key, ou WALLP_KEY)")
@@ -237,9 +237,10 @@ def fetch_web(key, timeout=20):
     falhas = []
 
     def get(tier):
-        qs = urllib.parse.urlencode(
-            {"purity": tier, "sorting": "random", "apikey": key}
-        )
+        params = {"purity": tier, "sorting": "random", "apikey": key}
+        if query:
+            params["q"] = query
+        qs = urllib.parse.urlencode(params)
         req = urllib.request.Request(f"{API}?{qs}", headers={"User-Agent": "wallp/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read()).get("data") or []
@@ -825,7 +826,7 @@ def build_gui():
         def __init__(self, app, cfg):
             super().__init__(application=app, title="wallp")
             self.cfg = cfg
-            self.set_default_size(600, 720)
+            self.set_default_size(800, 720)
 
             prov = Gtk.CssProvider()
             prov.load_from_data(CSS)
@@ -877,6 +878,13 @@ def build_gui():
             btn.add_css_class("suggested-action")
             btn.connect("clicked", lambda *_: self.load())
             title.append(btn)
+            # busca na web: mesmo formato de exibicao, filtra pelo termo.
+            # Enter busca, limpar + Enter volta ao aleatorio. O R respeita
+            # a busca ativa. Largura fixa para nao brigar com o campo Pasta.
+            self.search = Gtk.Entry(placeholder_text="buscar na web…")
+            self.search.set_width_chars(18)
+            self.search.connect("activate", lambda *_: self.on_search())
+            title.append(self.search)
             # Titulo a esquerda, nao centralizado: o centro deixava um vao
             # morto a esquerda (fantasma do toggle lista/grade removido) e
             # espremia o campo. Com pack_start + hexpand a Pasta usa tudo.
@@ -934,6 +942,7 @@ def build_gui():
             self._cell_geom = None    # (ncols, cw, ch) aplicados por ultimo
             self._laid_out = -1       # quantas celulas o ultimo layout anexou
             self._resize_id = None    # idle de resize pendente
+            self._query = ""            # busca ativa na web (vazio = aleatorio)
             self._monitor = None      # GFileMonitor da pasta atual
             self._mon_path = ""       # pasta que o monitor vigia
             self._deb_id = None       # debounce das mudancas no disco
@@ -1508,17 +1517,25 @@ def build_gui():
                          warn=not keep_status)
                 return
             self._web_busy = True
-            self.say("buscando wallpapers 18+ no wallhaven...")
-            threading.Thread(target=self._web_worker, args=(key,), daemon=True).start()
+            q = self._query or ""
+            self.say(f"buscando wallpapers 18+ no wallhaven...{f' ({q})' if q else ''}")
+            threading.Thread(target=self._web_worker, args=(key, q),
+                             daemon=True).start()
 
         def entry_key(self):
             return load_config().get("key", "")
 
-        def _web_worker(self, key):
+        def _web_worker(self, key, query=""):
             try:
-                GLib.idle_add(self._web_done, fetch_web(key), None)
+                GLib.idle_add(self._web_done, fetch_web(key, query=query), None)
             except Exception as e:  # noqa: BLE001
                 GLib.idle_add(self._web_done, [], str(e))
+
+        def on_search(self):
+            """Enter no campo de busca: filtra a web pelo termo. Limpar +
+            Enter volta ao aleatorio. O R respeita a busca ativa."""
+            self._query = self.search.get_text().strip()
+            self.load_web()
 
         def _web_done(self, data, err):
             self._web_busy = False
@@ -1545,7 +1562,8 @@ def build_gui():
                               w.get("purity", ""), item)
             self.resize_grid()
             n_sfw = sum(1 for w in data if w["purity"] == "nsfw")
-            self.say(f"{len(data)} da web ({n_sfw} nsfw, {len(data) - n_sfw} sketchy)"
+            q = f" · busca '{self._query}'" if self._query else ""
+            self.say(f"{len(data)} da web ({n_sfw} nsfw, {len(data) - n_sfw} sketchy){q}"
                      f" · R sorteia · N proximo · Enter aplica")
             return False
 
