@@ -850,7 +850,6 @@ def build_gui():
             self._web_busy = False # trava R durante o fetch
             self._width = 0
             self._tray = None
-            self._pending = []       # celulas ainda nao posicionadas
             self._ncols = GRID_COLS_DEFAULT
             self._resize_id = None    # idle de resize pendente
 
@@ -1173,33 +1172,31 @@ def build_gui():
             for h in self.headers:
                 self.listbox.remove(h)
             for cell in self.grid_items:
-                # so remove o que foi realmente anexado: uma celula ainda em
-                # _pending nunca foi anexada e o GTK reclama com um
-                # gtk_grid_remove assertion
+                # so remove o que foi realmente anexado: entre o add_item e
+                # o resize_grid a celula esta registrada mas ainda sem pai,
+                # e o GTK reclama com um gtk_grid_remove assertion
                 if cell.get_parent() is not None:
                     self.grid.remove(cell)
             self.rows.clear()
             self.headers.clear()
             self.grid_items.clear()
             self.web_refs.clear()
-            self._pending.clear()
             self._ncols = GRID_COLS_DEFAULT
 
         def _relayout(self):
-            """Posiciona as celulas pendentes em linhas de _ncols.
+            """Anexa TODAS as celulas em ordem de insercao, com o _ncols atual.
 
-            Como as colunas sao responsivas, nao da pra fixar a posicao no
-            attach: cada celula nova ou uma mudanca de largura tem que
-            reposicionar todas.
+            Antes, so as celulas em _pending eram posicionadas: as ja
+            anexadas ficavam presas no ncols de quando entraram. Como os
+            locais entram primeiro (antes da janela ter largura medida) e a
+            web chega depois, a grade virava duas grades sobrepostas -- os
+            locais em 3 colunas finas a esquerda e a web em 6 no resto.
             """
             n = self._ncols
-            order = list(self.grid_items)          # ordem de insercao = ordem visual
-            for cell in self._pending:
-                if cell not in self.grid_items:
-                    continue
-                pos = order.index(cell)
+            for pos, cell in enumerate(list(self.grid_items)):
+                if cell.get_parent() is self.grid:
+                    self.grid.remove(cell)
                 self.grid.attach(cell, pos % n, pos // n, 1, 1)
-            self._pending.clear()
 
         def clear_web(self):
             """Remove as linhas da web e seu cabecalho, preservando as locais."""
@@ -1238,7 +1235,8 @@ def build_gui():
             if self.stack.get_visible_child_name() == "grid":
                 cell = GridCell(pixbuf, badge)
                 cell.item = item
-                self._pending.append(cell)      # posicionado no fim, por _relayout
+                # nao anexa aqui: resize_grid()/_relayout() posiciona tudo
+                # de uma vez no fim do lote, com um ncols so
                 self.grid_items[cell] = item
                 if item["kind"] == "web":
                     self.web_refs.append((cell, self.grid))
@@ -1503,7 +1501,7 @@ def build_gui():
             self.clear()
 
             n_local = self.load_local(folder)
-            # no modo grade as celulas ficam em _pending ate um resize_grid;
+            # no modo grade as celulas so sao anexadas por resize_grid;
             # sem esta chamada a grade ficava em branco ao apertar "Abrir"
             if self.stack.get_visible_child_name() == "grid":
                 self.resize_grid()
