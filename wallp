@@ -880,6 +880,9 @@ def build_gui():
             # Titulo a esquerda, nao centralizado: o centro deixava um vao
             # morto a esquerda (fantasma do toggle lista/grade removido) e
             # espremia o campo. Com pack_start + hexpand a Pasta usa tudo.
+            # O Label vazio cala o titulo padrao: sem title_widget o
+            # HeaderBar mostra o titulo da janela ("wallp") no meio.
+            hb.set_title_widget(Gtk.Label(label=""))
             hb.pack_start(title)
             root.append(hb)
 
