@@ -142,6 +142,7 @@ DEFAULT_CFG = {
     "unit": "s",       # "s" | "min" (so como o valor e mostrado)
     "view": "list",    # "list" | "grid"
     "boot": False,
+    "cache_limit_mb": 100,  # teto dos originais aplicados no cache
 }
 
 
@@ -160,6 +161,10 @@ def load_config():
         cfg["interval"] = max(0, int(cfg["interval"]))
     except (TypeError, ValueError):
         cfg["interval"] = DEFAULT_CFG["interval"]
+    try:
+        cfg["cache_limit_mb"] = max(1, int(cfg["cache_limit_mb"]))
+    except (TypeError, ValueError):
+        cfg["cache_limit_mb"] = DEFAULT_CFG["cache_limit_mb"]
     if cfg.get("unit") not in ("s", "min"):
         cfg["unit"] = "s"
     if cfg.get("view") not in ("list", "grid"):
@@ -363,6 +368,75 @@ def download_wallpaper(w, folder):
                        pathlib.Path(w["path"]).suffix)
     dest.write_bytes(_get_bytes(w["path"], timeout=180))
     return dest
+
+
+def cache_full_files():
+    """Originais aplicados que moram no cache. Nunca thumbs.
+
+    Regra pelo nome: *_full.* (padrao atual) ou {id} de 6 chars (legados,
+    que eram full). *_lg.jpg e local/ ficam de fora -- a grade precisa
+    deles e eles nao entram na conta do limite.
+    """
+    out = []
+    try:
+        entries = list(CACHE_DIR.iterdir())
+    except OSError:
+        return out
+    for f in entries:
+        if not f.is_file() or f.suffix.lower() not in IMG_EXT:
+            continue
+        stem = f.stem
+        if stem.endswith("_lg"):
+            continue
+        if not (stem.endswith("_full") or len(stem) == 6):
+            continue
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        out.append((st.st_mtime, st.st_size, f))
+    return out
+
+
+def enforce_cache_limit(limit_mb, protect=()):
+    """Apaga originais mais antigos ate caber no limite.
+
+    protect: caminhos que nunca saem (o recem-aplicado + o que o GNOME
+    aponta). Se a leitura do gsettings falhar, quem chama passa so o
+    recem-aplicado -- e se nem isso existir, nao apaga nada. Devolve
+    (arquivos restantes, bytes liberados).
+    """
+    try:
+        limit = max(1, int(limit_mb)) * 1024 * 1024
+    except (TypeError, ValueError):
+        return 0, 0
+    files = cache_full_files()
+    total = sum(sz for _, sz, _ in files)
+    if total <= limit:
+        return len(files), 0
+    prot = set()
+    for p in protect:
+        try:
+            prot.add(str(pathlib.Path(p).resolve()))
+        except OSError:
+            pass
+    freed = 0
+    files.sort(key=lambda t: t[0])      # mais antigos primeiro
+    for _, sz, f in files:
+        if total <= limit:
+            break
+        try:
+            if str(f.resolve()) in prot:
+                continue
+        except OSError:
+            continue
+        try:
+            f.unlink()
+            total -= sz
+            freed += sz
+        except OSError:
+            pass
+    return sum(1 for _, _, f in files if f.exists()), freed
 
 
 # --------------------------------------------------------------------------- aplicar
@@ -1833,6 +1907,33 @@ def build_gui():
                 set_wallpaper(dest)
             except Exception as e:  # noqa: BLE001
                 GLib.idle_add(self.say, f"falhou: {e}", True)
+                return
+            # teto do cache: roda na thread de download, fora da UI
+            try:
+                kept, freed = enforce_cache_limit(
+                    self.cfg.get("cache_limit_mb", 100),
+                    protect=self._current_uris() | {str(dest)})
+                if freed:
+                    GLib.idle_add(self.say,
+                                  f"aplicado: {dest.name} "
+                                  f"(cache: -{freed // 1024} KB)")
+            except Exception:  # noqa: BLE001
+                pass
+
+        def _current_uris(self):
+            """Caminhos que o GNOME aponta agora (claro + escuro)."""
+            out = set()
+            for key in ("picture-uri", "picture-uri-dark"):
+                try:
+                    r = subprocess.run(
+                        ["gsettings", "get", "org.gnome.desktop.background", key],
+                        capture_output=True, text=True, timeout=10)
+                except (subprocess.SubprocessError, OSError):
+                    continue
+                uri = r.stdout.strip().strip("'").strip('"')
+                if uri.startswith("file://"):
+                    out.add(urllib.parse.unquote(uri[7:]))
+            return out
 
         def do_size_allocate(self, *a):  # noqa: N802
             Gtk.ApplicationWindow.do_size_allocate(self, *a)
@@ -1935,6 +2036,10 @@ def main():
               f"a cada {human_time(cfg['interval'])}")
         print(f"boot      : {boot_status()}")
         print(f"key       : {'configurada' if cfg['key'] else 'ausente'}")
+        fulls = cache_full_files()
+        used = sum(sz for _, sz, _ in fulls)
+        print(f"cache     : {len(fulls)} originais, "
+              f"{used // 1024 // 1024} MB de {cfg.get('cache_limit_mb', 100)} MB")
         return 0
 
     # ---- interface

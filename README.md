@@ -78,9 +78,17 @@ gráfica aberta.
 
 | caminho | conteúdo |
 |---|---|
-| `~/.config/wallp/config.json` | pasta, key, intervalo, view — modo `0600` |
-| `~/.cache/wallp/<id>.jpg` | miniaturas (~20 KB) |
-| `~/.cache/wallp/<id>.<ext>` | imagem em resolução original, ao aplicar |
+| `~/.config/wallp/config.json` | pasta, key, intervalo, view, limite do cache — modo `0600` |
+| `~/.cache/wallp/<id>_lg.jpg` | miniaturas da web (~30 KB) |
+| `~/.cache/wallp/local/<hash>.jpg` | miniaturas locais |
+| `~/.cache/wallp/<id>_full.<ext>` | original aplicado da web |
+
+## Limite do cache
+
+Os originais aplicados ficam no cache e cresciam sem limite (468 MB
+medidos). Depois de cada aplicação da web, o app apaga os mais antigos
+até caber em `cache_limit_mb` (padrão 100) — nunca o recém-aplicado, nunca
+o que o GNOME aponta, nunca os thumbs. `wallp --status` mostra o uso.
 | `~/.local/share/icons/hicolor/scalable/apps/io.wallp.App.svg` | ícone |
 | `~/.local/share/applications/io.wallp.App.desktop` | entrada do menu de apps |
 
