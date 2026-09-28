@@ -885,6 +885,11 @@ def build_gui():
             self.search.set_width_chars(18)
             self.search.connect("activate", lambda *_: self.on_search())
             title.append(self.search)
+            # lupa: mesmo que Enter, para quem prefere clicar
+            find_btn = Gtk.Button(icon_name="system-search-symbolic")
+            find_btn.set_tooltip_text("Buscar na web")
+            find_btn.connect("clicked", lambda *_: self.on_search())
+            title.append(find_btn)
             # Titulo a esquerda, nao centralizado: o centro deixava um vao
             # morto a esquerda (fantasma do toggle lista/grade removido) e
             # espremia o campo. Com pack_start + hexpand a Pasta usa tudo.
