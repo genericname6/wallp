@@ -852,6 +852,7 @@ def build_gui():
             self._tray = None
             self._pending = []       # celulas ainda nao posicionadas
             self._ncols = GRID_COLS_DEFAULT
+            self._resize_id = None    # idle de resize pendente
 
             self.ctrl = Gtk.EventControllerKey()
             self.ctrl.connect("key-pressed", self.on_key)
@@ -1172,7 +1173,11 @@ def build_gui():
             for h in self.headers:
                 self.listbox.remove(h)
             for cell in self.grid_items:
-                self.grid.remove(cell)
+                # so remove o que foi realmente anexado: uma celula ainda em
+                # _pending nunca foi anexada e o GTK reclama com um
+                # gtk_grid_remove assertion
+                if cell.get_parent() is not None:
+                    self.grid.remove(cell)
             self.rows.clear()
             self.headers.clear()
             self.grid_items.clear()
@@ -1253,11 +1258,22 @@ def build_gui():
             a celula (em largura e altura, sempre no 21:9) ate caberem as
             linhas que cabem na altura. Isso evita a rolagem enorme.
             """
-            # a largura real da grade. usar self.scroll.get_width() dava o
-            # minimo do clamp (160) enquanto a janela nao estava alocada, e a
-            # grade ficava com 4 colunas de 124px num monitor de 1900px
-            avail_w = max(160, (self.get_width() or 0) - 40)
-            avail_h = max(120, (self.get_height() or 0) - 190)
+            # largura real da grade. NAO usar max(160, ...): quando
+            # get_width() devolve 0 (janela ainda nao alocada) o clamp
+            # transformava 0 em 160, e a formula calculava 6 colunas de 6px
+            # que ficavam travadas -- a grade so se ajustava quando o
+            # usuario clicava no toggle de view.
+            w = self.get_width() or 0
+            h = self.get_height() or 0
+            if w <= 0 or h <= 0:
+                # ainda nao alocada: usa a largura real do stack, que ja
+                # tem o tamanho do viewport, e nao o clamp de 160
+                w = self.stack.get_width() or 0
+                h = self.stack.get_height() or 0
+            if w <= 0 or h <= 0:
+                return self._ncols, 0, 0
+            avail_w = max(160, w - 40)
+            avail_h = max(120, h - 190)
             n = len(self.grid_items)
             if not n:
                 return 0, 0, 0
@@ -1586,15 +1602,44 @@ def build_gui():
                 GLib.idle_add(self.say, f"falhou: {e}", True)
 
         def do_size_allocate(self, *a):  # noqa: N802
-            # recalcula quando a largura REAL da janela muda. medir o
-            # ScrolledWindow dava valor velho/temporario e a grade travava
-            # num tamanho errado (so 4 colunas num monitor largo)
-            if self.stack.get_visible_child_name() == "grid":
-                w = self.get_width()
-                if w and abs(w - self._width) > 8:
-                    self._width = w
-                    self.resize_grid()
             Gtk.ApplicationWindow.do_size_allocate(self, *a)
+            if self.stack.get_visible_child_name() != "grid":
+                return
+            w = self.get_width()
+            if not w or abs(w - self._width) <= 4:
+                return
+            self._width = w
+            # Nao recalcula aqui. Durante um arraste chegam dezenas de
+            # eventos de resize em poucos ms, e medir dentro do size_allocate
+            # pega a largura antiga -- a grade saia com colunas de 6px e nunca
+            # mais se ajustava sozinha, so quando o usuario clicava no toggle.
+            # Adia para um tick de dois frames, que e quando o compositor ja
+            # parado deixa get_width() devolver o valor final.
+            if self._resize_id:
+                GLib.source_remove(self._resize_id)
+            self._resize_id = GLib.timeout_add(45, self._deferred_resize)
+
+        def _deferred_resize(self):
+            """Recalcula a grade quando a janela ja assentou.
+
+            Repete enquanto a largura estiver mudando: um unico tick pode
+            pegar a largura ainda em transicao, e nesse caso a grade ficava
+            travada no valor errado ate o proximo clique manual.
+            """
+            self._resize_id = None
+            if self.stack.get_visible_child_name() != "grid":
+                return False
+            w = self.get_width()
+            if w <= 0:
+                self._resize_id = GLib.timeout_add(45, self._deferred_resize)
+                return True
+            self.resize_grid()
+            if abs(w - self._width) > 4:
+                # ainda mexendo: tenta de novo
+                self._width = w
+                self._resize_id = GLib.timeout_add(45, self._deferred_resize)
+                return True
+            return False
 
     return Win
 
