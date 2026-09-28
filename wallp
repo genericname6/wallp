@@ -250,9 +250,12 @@ def fetch_web(key, timeout=20):
         except (urllib.error.URLError, ValueError, TimeoutError) as e:
             falhas.append(type(e).__name__)
 
-    # todas as requisicoes falharam != a API respondeu e nao tinha 18+
+    # todas as requisicoes falharam != a API respondeu e nao tinha 18+.
+    # O texto inclui o codigo HTTP e sugere retry: 403 aqui e bloqueio
+    # temporario do wallhaven, NAO key invalida (key invalida da 401).
     if falhas and len(falhas) == len(PURITY_PEDIDO) and not out:
-        raise RuntimeError("wallhaven: " + ", ".join(falhas))
+        raise RuntimeError(f"wallhaven recusou ({', '.join(falhas)}); "
+                           f"aperte R para tentar de novo")
     return out
 
 
@@ -1429,9 +1432,11 @@ def build_gui():
                 self.say(f"web: {err}", warn=True)
                 return False
             if not data:
-                # nao distingue "0 resultados" de "as requisicoes falharam"
-                # (rede com 403 caia aqui e dizia "nenhum 18+ retornou")
-                self.say("web: a API nao respondeu (chave invalida ou sem rede)",
+                # fetch_web levanta excecao quando a rede falha; chegar aqui
+                # com [] e sem erro significa que a API respondeu mas o
+                # filtro 18+ removeu tudo (o param purity do servidor nao
+                # filtra nada, entao as vezes o lote vem sem nsfw/sketchy)
+                self.say("web: o lote veio sem nenhum nsfw/sketchy (tente R)",
                          warn=True)
                 return False
 
