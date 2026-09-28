@@ -1348,12 +1348,42 @@ def build_gui():
             if pb is not None:
                 item["_pb"] = pb
             else:
-                POOL.submit(self._local_worker, f, item)
+                self._decode_later(f, item)
             try:
                 kb = f.stat().st_size // 1024
             except OSError:
                 kb = 0
             return self.add_item(pb, f.name, f"{kb} KB", None, item)
+
+        def _decode_later(self, f, item, delays=(3, 8)):
+            """Decodifica fora da UI, com retentativas.
+
+            Se o arquivo ainda estava sendo escrito na hora (ex.: o monitor
+            adotou um download pela metade), a primeira decode falha e a
+            celula ficaria vazia para sempre -- o _downloaded acha que "ja
+            esta na lista" e nao recodifica. As retentativas cobrem isso.
+            """
+            POOL.submit(self._local_worker, f, item)
+            item["_tr"] = list(delays)
+
+            def retry():
+                if item.get("_pb") is not None:
+                    return False
+                if not any(it is item for it in self.items.values()):
+                    return False      # saiu da lista: desiste
+                if not pathlib.Path(item["path"]).exists():
+                    return False
+                pending = item.get("_tr") or []
+                if not pending:
+                    return False
+                item["_tr"] = pending[1:]
+                POOL.submit(self._local_worker, f, item)
+                if item["_tr"]:
+                    GLib.timeout_add_seconds(item["_tr"][0], retry)
+                return False
+
+            if delays:
+                GLib.timeout_add_seconds(delays[0], retry)
 
         def load_local(self, folder):
             # sem cabecalho: na grade unica nao ha titulos de secao, os
@@ -1805,12 +1835,25 @@ def build_gui():
 
         def _downloaded(self, dest, folder):
             """Arquivo chegou: avisa onde salvou, anexa e mostra."""
+            # tira primeiro o parcial que o monitor pode ter adotado no meio
+            # do download: sem isso o adopt acha que "ja esta na lista" e a
+            # celula fica com o thumb quebrado para sempre
+            self._drop_local(str(dest))
             n = self._adopt_new(folder)
             self.say(f"baixado: {dest.name}  →  {folder}"
                      + ("" if n else " (ja estava na lista)"))
             if n:
                 self._reveal_item(dest)
             return False
+
+        def _drop_local(self, path):
+            """Tira o item local do caminho dado (para re-anexar completo)."""
+            for w, it in list(self.items.items()):
+                if it["kind"] == "local" and it["path"] == str(path):
+                    if w.get_parent() is not None:
+                        self.grid.remove(w)
+                    del self.items[w]
+                    self.web.discard(w)
 
         def _apply_web(self, w):
             GLib.idle_add(self.say, f"baixando {w['id']}...")
