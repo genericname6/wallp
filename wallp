@@ -63,18 +63,6 @@ THUMB_W, THUMB_H = 96, 96
 
 ICON_NAME = "io.wallp.App"   # ~/.local/share/icons/hicolor/scalable/apps/
 
-# Rastreio temporario do botao direito: cada etapa da cadeia
-# gesto -> menu -> acao -> pasta -> download anexa uma linha aqui.
-# Onde as marcas pararem, esta o elo quebrado. Remover quando diagnosticar.
-RTRACE = "/tmp/opencode/rtrace.log"
-
-
-def _trace(msg):
-    try:
-        with open(RTRACE, "a") as f:
-            f.write(f"{__import__('time').strftime('%H:%M:%S')} {msg}\n")
-    except OSError:
-        pass
 
 # pasta padrao do download (botao direito): usada quando o campo do topo
 # esta vazio. Criada automaticamente no primeiro download.
@@ -1043,7 +1031,6 @@ def build_gui():
 
         # ---------------- status / sync
         def say(self, msg, warn=False):
-            _trace(f"STATUS: {msg}")
             self.status.set_label(msg)
             self.status.remove_css_class("warning")
             if warn:
@@ -1690,18 +1677,12 @@ def build_gui():
             return self.grid_items.get(node)
 
         def on_grid_rightclick(self, gesture, n_press, x, y):
-            _trace(f"GESTO grade n_press={n_press} x={x:.0f} y={y:.0f}")
             if item := self._grid_item_at(x, y):
-                _trace(f"ITEM grade kind={item.get('kind')}")
                 self.show_ctx_menu(self.grid, x, y, item)
-            else:
-                _trace("ITEM grade: nada sob o cursor")
 
         def on_list_rightclick(self, gesture, n_press, x, y):
-            _trace(f"GESTO lista n_press={n_press} x={x:.0f} y={y:.0f}")
             row = self.listbox.get_row_at_y(y)
             item = self.rows.get(row) if row is not None else None
-            _trace(f"ITEM lista kind={(item or {}).get('kind')}")
             if item is not None:
                 self.show_ctx_menu(self.listbox, x, y, item)
 
@@ -1715,9 +1696,7 @@ def build_gui():
             disparava nada, sem erro nenhum. Aqui nao ha despacho de acao.
             """
             if item.get("kind") != "web":
-                _trace("MENU: item local, sem menu (esperado)")
                 return
-            _trace(f"MENU abrindo id={item['w']['id']}")
             self._ctx_item = item
             self._close_pop()
             pop = Gtk.Popover()
@@ -1797,7 +1776,6 @@ def build_gui():
 
         def on_download_action(self):
             """Botao direito > Baixar. So chega aqui com item da web."""
-            _trace("ACAO download disparada")
             item = self._ctx_item
             self._ctx_item = None
             if not item or item.get("kind") != "web":
@@ -1819,7 +1797,6 @@ def build_gui():
             """
             typed = self.entry.get_text().strip()
             folder = pathlib.Path(typed or str(DEFAULT_FOLDER)).expanduser()
-            _trace(f"PASTA entry={typed!r} destino={folder}")
             folder.mkdir(parents=True, exist_ok=True)
             if not typed:
                 self.entry.set_text(str(folder))
@@ -1828,13 +1805,10 @@ def build_gui():
             return folder
 
         def _download_web(self, w, folder):
-            _trace(f"DOWNLOAD inicio id={w['id']}")
             GLib.idle_add(self.say, f"baixando {w['id']}...")
             try:
                 dest = download_wallpaper(w, folder)
-                _trace(f"DOWNLOAD ok {dest.name} {dest.stat().st_size}b")
             except Exception as e:  # noqa: BLE001
-                _trace(f"DOWNLOAD falhou: {type(e).__name__}: {e}")
                 GLib.idle_add(self.say, f"falhou: {e}", True)
                 return
             GLib.idle_add(self._downloaded, dest, folder)
