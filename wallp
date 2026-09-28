@@ -877,7 +877,10 @@ def build_gui():
             btn.add_css_class("suggested-action")
             btn.connect("clicked", lambda *_: self.load())
             title.append(btn)
-            hb.set_title_widget(title)
+            # Titulo a esquerda, nao centralizado: o centro deixava um vao
+            # morto a esquerda (fantasma do toggle lista/grade removido) e
+            # espremia o campo. Com pack_start + hexpand a Pasta usa tudo.
+            hb.pack_start(title)
             root.append(hb)
 
             # ---------------- grade (unica view: a lista foi removida) --
