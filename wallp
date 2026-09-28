@@ -1695,8 +1695,11 @@ def build_gui():
             menu.append("Baixar para a pasta", "win.download")
             pop = Gtk.PopoverMenu.new_from_model(menu)
             pop.set_parent(widget)
-            pop.set_pointing_to(Gdk.Rectangle(x=int(x), y=int(y),
-                                              width=1, height=1))
+            # Gdk.Rectangle() ignora argumentos no construtor (vira 0,0,0,0
+            # e o menu abria no lugar errado): preenche campo a campo
+            at = Gdk.Rectangle()
+            at.x, at.y, at.width, at.height = int(x), int(y), 1, 1
+            pop.set_pointing_to(at)
             pop.connect("closed", lambda p: p.unparent())
             self._pop = pop
             pop.popup()
