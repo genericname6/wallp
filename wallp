@@ -654,7 +654,16 @@ def boot_status():
 # --------------------------------------------------------------------------- modo headless
 
 def run_headless(cfg):
-    """Sem janela, sem Gtk: daemon de rotacao (~27 MB)."""
+    """Sem janela, sem Gtk: daemon de rotacao (~27 MB).
+
+    Obedece o flag rotate: com ele desligado sai na hora (0, limpo, sem
+    restart). Antes ignorava o flag e girava sempre que o servico estava
+    rodando -- desmarcar no app nao parava o do sistema.
+    """
+    if not cfg.get("rotate"):
+        print("wallp: rotacao desligada (marque no app ou rode com rotate:true)",
+              file=sys.stderr)
+        return 0
     rot = Rotator(cfg["folder"], cfg["interval"])
     rot.rescan()
     if not rot.files:
@@ -959,7 +968,16 @@ def build_gui():
             self.connect("close-request", self.on_close)
 
             if cfg.get("rotate"):
-                self.rotator.start()
+                if self._boot_managed():
+                    # servico instalado: ele gira; garante que esta de pe
+                    # (ex.: voltou de um crash com burst esgotado)
+                    ok, _out = _systemctl("start", "wallp.service")
+                    if ok:
+                        self.rotator.stop()
+                    else:
+                        self.rotator.start()
+                else:
+                    self.rotator.start()
             self.sync_rotate_ui()
 
             self.load()
@@ -1051,8 +1069,18 @@ def build_gui():
             if warn:
                 self.status.add_css_class("warning")
 
+        def _boot_managed(self):
+            """O servico do systemd esta habilitado? Se sim, E ELE quem gira
+            e o app nao gira em processo -- senao os dois aplicariam juntos,
+            cada um no seu ritmo. O checkbox passa a seguir o flag (que os
+            dois obedecem), nao o rotator local."""
+            try:
+                return boot_status() == "enabled"
+            except Exception:  # noqa: BLE001
+                return False
+
         def sync_rotate_ui(self):
-            on = self.rotator.active
+            on = bool(self.cfg.get("rotate"))
             self.chk_rotate.set_active(on)
             self.chk_boot.set_active(bool(self.cfg.get("boot")))
             self.chk_rotate.set_sensitive(self.rotator.available())
@@ -1065,6 +1093,12 @@ def build_gui():
             self.on_rot_tick(self.rotator)
 
         def on_rot_tick(self, rot):
+            # flag ligado mas rotator local parado = o servico esta girando
+            # (por construcao so um dos dois gira por vez)
+            if self.cfg.get("rotate") and not rot.active:
+                self.clock.set_state(True, 0.0)
+                self.countdown.set_text("girando pelo servico")
+                return
             if rot.active and rot.interval > 0:
                 prog = 1 - (rot.remaining / rot.interval)
                 self.clock.set_state(True, prog)
@@ -1082,10 +1116,28 @@ def build_gui():
 
         # ---------------- handlers
         def on_rotate_toggle(self, btn):
-            if btn.get_active() != self.rotator.active:
-                self.rotator.toggle()
-            self.cfg["rotate"] = self.rotator.active
-            save_config(self.cfg)
+            want = btn.get_active()
+            if want:
+                self.cfg["rotate"] = True
+                save_config(self.cfg)
+                if self._boot_managed():
+                    # o servico gira; o app nao gira junto para nao aplicar
+                    # em duplicata. Se o systemd falhar, gira aqui dentro.
+                    self.rotator.stop()
+                    ok, _out = _systemctl("start", "wallp.service")
+                    if not ok:
+                        self.rotator.start()
+                else:
+                    self.rotator.start()
+            else:
+                # desligar aqui desliga em todo lugar: o daemon obedece o
+                # flag e o servico e parado junto. Era esse o bug: antes o
+                # daemon ignorava o flag e continuava sozinho.
+                self.cfg["rotate"] = False
+                save_config(self.cfg)
+                self.rotator.stop()
+                if self._boot_managed():
+                    _systemctl("stop", "wallp.service")
             self.sync_rotate_ui()
 
         def on_interval_changed(self, *_):
@@ -1104,8 +1156,16 @@ def build_gui():
         def on_boot_toggle(self, btn):
             if btn.get_active():
                 boot_enable(self.cfg)
+                # o servico (enable --now) assume a rotacao: o processo
+                # local para para nao aplicar em duplicata
+                if self.cfg.get("rotate"):
+                    self.rotator.stop()
             else:
                 boot_disable(self.cfg)
+                # sem servico, a rotacao volta para dentro do app
+                if self.cfg.get("rotate"):
+                    self.rotator.start()
+            self.sync_rotate_ui()
             self.say(f"boot: {boot_status()}")
 
         def on_next(self):
