@@ -321,7 +321,12 @@ def fetch_thumb(w):
 
 
 def fetch_full(w):
-    dest = CACHE_DIR / f"{w['id']}{pathlib.Path(w['path']).suffix}"
+    # _full no nome, de proposito: o nome antigo ({id}.jpg) colidia com os
+    # thumbs small, que tem o MESMO nome. Resultado: ao clicar para aplicar,
+    # o app devolvia o thumb de 300px em vez de baixar o original -- e o
+    # papel de parede saia borrado em tela cheia. 6697 thumbs nessas
+    # condicoes foram medidos no cache.
+    dest = CACHE_DIR / f"{w['id']}_full{pathlib.Path(w['path']).suffix}"
     if dest.exists() and dest.stat().st_size > 1000:
         return dest
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
