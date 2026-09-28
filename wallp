@@ -1589,6 +1589,14 @@ def build_gui():
         # -- acoes
         def load(self):
             folder = self.entry.get_text().strip()
+            if not folder:
+                # campo vazio: cai na padrao (cria se nao existir), igual ao
+                # download. Antes o load nao tinha esse fallback e mostrava
+                # "pasta vazia" mesmo com a padrao disponivel.
+                folder = str(DEFAULT_FOLDER)
+                pathlib.Path(folder).expanduser().mkdir(parents=True,
+                                                         exist_ok=True)
+                self.entry.set_text(folder)
             self.cfg["folder"] = folder
             save_config(self.cfg)
             self.clear()
