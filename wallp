@@ -1014,6 +1014,9 @@ def build_gui():
             self._cell_geom = None    # (ncols, cw, ch) aplicados por ultimo
             self._laid_out = -1       # quantas celulas o ultimo layout anexou
             self._resize_id = None    # idle de resize pendente
+            self._monitor = None      # GFileMonitor da pasta atual
+            self._mon_path = ""       # pasta que o monitor vigia
+            self._deb_id = None       # debounce das mudancas no disco
             self._ctx_item = None     # item do menu de botao direito
             self._pop = None          # popover do menu, para nao perder a ref
 
@@ -1235,6 +1238,7 @@ def build_gui():
 
         def quit_app(self):
             self.rotator.stop()
+            self._unwatch()
             if self._tray:
                 GLib.idle_add(self._tray.hide)
             self.get_application().quit()
@@ -1728,7 +1732,78 @@ def build_gui():
                 self.cfg["rotate"] = False
                 save_config(self.cfg)
 
+            self._watch_folder(folder)
             self.load_web(keep_status=msg)
+
+        def _watch_folder(self, folder):
+            """Vigia a pasta carregada: arquivo novo entra sozinho, apagado
+            some sozinho. Sem pasta valida, sem monitor."""
+            self._unwatch()
+            p = pathlib.Path(folder).expanduser()
+            if not folder or not p.is_dir():
+                return
+            try:
+                mon = Gio.File.new_for_path(str(p)).monitor_directory(
+                    Gio.FileMonitorFlags.NONE, None)
+            except GLib.Error:
+                return
+            mon.connect("changed", self._on_dir_changed)
+            self._monitor = mon
+            self._mon_path = str(p)
+
+        def _unwatch(self):
+            mon, self._monitor = self._monitor, None
+            self._mon_path = ""
+            if mon is not None:
+                try:
+                    mon.cancel()
+                except Exception:  # noqa: BLE001
+                    pass
+            if self._deb_id is not None:
+                try:
+                    GLib.source_remove(self._deb_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                self._deb_id = None
+
+        def _on_dir_changed(self, mon, f1, f2, ev):
+            # um save gera varios eventos em sequencia: coalesce num so
+            # rescan 500ms depois da ultima mudanca
+            if self._deb_id is not None:
+                return
+            self._deb_id = GLib.timeout_add(500, self._dir_settled)
+
+        def _dir_settled(self):
+            """A pasta assentou: anexa os novos, tira os apagados."""
+            self._deb_id = None
+            folder = self._mon_path
+            if not folder:
+                return False
+            added = self._adopt_new(folder)
+            removed = self._remove_deleted(folder)
+            if added or removed:
+                self.rotator.folder = folder
+                self.rotator.rescan()
+                self.sync_rotate_ui()
+                self.say(f"pasta atualizada: +{added} -{removed}")
+            return False
+
+        def _remove_deleted(self, folder):
+            """Tira da lista os locais cujos arquivos sumiram do disco."""
+            gone = [w for w, it in {**self.rows, **self.grid_items}.items()
+                    if it["kind"] == "local"
+                    and not pathlib.Path(it["path"]).exists()]
+            for w in gone:
+                if w in self.rows:
+                    self.listbox.remove(w)
+                    del self.rows[w]
+                elif w in self.grid_items:
+                    if w.get_parent() is not None:
+                        self.grid.remove(w)
+                    del self.grid_items[w]
+            if gone and self.stack.get_visible_child_name() == "grid":
+                self.resize_grid()
+            return len(gone)
 
         def on_activate(self, _lb, row):
             if item := self.rows.get(row):
