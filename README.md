@@ -28,9 +28,8 @@ grava nada em disco.
 
 | tecla | ação |
 |---|---|
-| setas / <kbd>Enter</kbd> | navegar e aplicar |
+| <kbd>Enter</kbd> / duplo clique | aplicar o wallpaper |
 | <kbd>R</kbd> | sortear outro lote da web |
-| <kbd>V</kbd> | alternar lista / grade |
 | <kbd>N</kbd> | próximo wallpaper da pasta |
 | <kbd>Ctrl+Q</kbd> | sair de verdade |
 
@@ -43,16 +42,22 @@ O ícone de relógio no canto superior direito abre o popup de rotação:
 - o ponteiro do relógio completa uma volta por intervalo, então ele mostra a
   progresso da contagem — para de girar quando a rotação está desligada
 
-**Escolha manual desliga a rotação.** Clicar numa imagem da lista tem
+**Escolha manual desliga a rotação.** Clicar numa imagem da grade tem
 prioridade: se a rotação estava ligada, ela desliga de vez, senão o próximo
 tick sobrescreveria o seu clique. O botão *próximo* (tecla `N`) não desliga.
 
 ## Grade
 
-Células em **21:9** (mais larga que alta), com `ContentFit.COVER` — preenche a
-célula e corta o excesso, sem distorcer. As colunas são responsivas: quantas
-cabem na largura real da janela, com teto de 8. Escolhe sempre a **maior
-célula** que ainda caiba inteira, então nunca aparece barra horizontal.
+Única view do app (a lista foi removida). Células em **21:9** (mais larga
+que alta), com `ContentFit.COVER` — preenche a célula e corta o excesso,
+sem distorcer. As colunas são responsivas: quantas cabem na largura real
+da janela, com teto de 6. Escolhe sempre a **maior célula** que ainda
+caiba inteira, então nunca aparece barra horizontal. Os locais ficam
+primeiro, a web (com etiqueta `nsfw`/`sketchy`) depois.
+
+**Botão direito** num wallpaper da web abre **Baixar para a pasta**: salva
+o original na pasta do topo (ou `~/Pictures/wallpapers`, criada se preciso)
+e o arquivo entra na grade na hora.
 
 ## O filtro 18+
 
@@ -78,7 +83,7 @@ gráfica aberta.
 
 | caminho | conteúdo |
 |---|---|
-| `~/.config/wallp/config.json` | pasta, key, intervalo, view, limite do cache — modo `0600` |
+| `~/.config/wallp/config.json` | pasta, key, intervalo, limite do cache — modo `0600` |
 | `~/.cache/wallp/<id>_lg.jpg` | miniaturas da web (~30 KB) |
 | `~/.cache/wallp/local/<hash>.jpg` | miniaturas locais |
 | `~/.cache/wallp/<id>_full.<ext>` | original aplicado da web |
@@ -108,7 +113,7 @@ Medido nesta máquina:
 | modo | RSS |
 |---|---|
 | `wallp --rotate` (daemon, sem Gtk) | **35 MB** |
-| janela GTK4, lista carregada | 233 MB |
+| janela GTK4, grade carregada | 233 MB |
 
 O GTK4 via PyGObject custa ~200 MB no `import` sozinho, antes de qualquer
 widget — nenhuma otimização aqui muda isso. Por isso o daemon do systemd **não

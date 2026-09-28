@@ -121,7 +121,6 @@ class DaemonPool:
 POOL = DaemonPool(n=6)
 
 CSS = b"""
-.tr { font-weight: bold; font-size: 1.05em; padding: 10px 4px 2px 4px; }
 .bd { font-size: 0.75em; padding: 1px 6px; border-radius: 9px; color: #111; }
 .nsfw { background: #e0555f; }
 .sk { background: #e0b23f; }
@@ -140,7 +139,6 @@ DEFAULT_CFG = {
     "rotate": False,
     "interval": 300,   # segundos
     "unit": "s",       # "s" | "min" (so como o valor e mostrado)
-    "view": "list",    # "list" | "grid"
     "boot": False,
     "cache_limit_mb": 100,  # teto dos originais aplicados no cache
 }
@@ -167,8 +165,6 @@ def load_config():
         cfg["cache_limit_mb"] = DEFAULT_CFG["cache_limit_mb"]
     if cfg.get("unit") not in ("s", "min"):
         cfg["unit"] = "s"
-    if cfg.get("view") not in ("list", "grid"):
-        cfg["view"] = "list"
     # a key do ambiente NUNCA vai para o arquivo: ela existe para poder
     # rodar sem credencial em disco. A do disco e a ultima coisa gravada,
     # entao o save_config reescreve por cima dela.
@@ -781,47 +777,6 @@ def build_gui():
             ctx.arc(cx, cy, 1.6, 0, 2 * math.pi)
             ctx.fill()
 
-    class Row(Gtk.ListBoxRow):
-        """Linha da lista. O item fica em .item."""
-
-        def __init__(self, pixbuf, title, subtitle, badge):
-            super().__init__()
-            self.item = None
-            self.set_activatable(True)
-
-            box = pad(Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12),
-                      top=6, bottom=6, start=8, end=8)
-
-            img = Gtk.Picture()
-            if (tex := paintable(pixbuf)) is not None:
-                img.set_paintable(tex)
-            img.set_content_fit(Gtk.ContentFit.COVER)
-            img.set_size_request(THUMB_W, THUMB_H)
-            img.add_css_class("card")
-            box.append(img)
-
-            txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            txt.set_hexpand(True)
-            txt.set_valign(Gtk.Align.CENTER)
-            lbl = Gtk.Label(label=title)
-            lbl.set_xalign(0)
-            lbl.set_ellipsize(3)
-            sub = Gtk.Label(label=subtitle)
-            sub.set_xalign(0)
-            sub.add_css_class("dim-label")
-            txt.append(lbl)
-            txt.append(sub)
-            box.append(txt)
-
-            if badge:
-                b = Gtk.Label(label=badge)
-                b.add_css_class("bd")
-                b.add_css_class(badge)
-                b.set_valign(Gtk.Align.CENTER)
-                box.append(b)
-
-            self.set_child(box)
-
     class GridCell(Gtk.Overlay):
         """Celula da grade: so a imagem em 21:9, com o badge sobreposto.
 
@@ -840,6 +795,7 @@ def build_gui():
             super().__init__()
             self.item = None
             self.set_hexpand(True)
+            self.set_focusable(True)   # permite rolar ate a celula (reveal)
 
             self.img = Gtk.Picture()
             if (tex := paintable(pixbuf)) is not None:
@@ -865,17 +821,6 @@ def build_gui():
             if (tex := paintable(pb)) is not None:
                 self.img.set_paintable(tex)
 
-    class Header(Gtk.ListBoxRow):
-        # is_web_header marca o cabecalho da web, para o clear_web remove-lo
-        def __init__(self, text, is_web=False):
-            super().__init__()
-            self.is_web_header = is_web
-            self.set_activatable(False)
-            lbl = Gtk.Label(label=text)
-            lbl.set_xalign(0)
-            lbl.add_css_class("tr")
-            self.set_child(lbl)
-
     class Win(Gtk.ApplicationWindow):
         def __init__(self, app, cfg):
             super().__init__(application=app, title="wallp")
@@ -892,12 +837,6 @@ def build_gui():
 
             # ---------------- barra
             hb = Gtk.HeaderBar()
-
-            self.view_btn = Gtk.ToggleButton(icon_name="view-grid-symbolic")
-            self.view_btn.set_tooltip_text("Alternar lista / grade (V)")
-            self.view_btn.set_active(cfg.get("view") == "grid")
-            self.view_btn.connect("toggled", self.on_view_toggle)
-            hb.pack_start(self.view_btn)
 
             reload_btn = Gtk.Button(icon_name="view-refresh-symbolic")
             reload_btn.set_tooltip_text("Sortear outros da web (R)")
@@ -948,20 +887,9 @@ def build_gui():
             top.append(btn)
             root.append(top)
 
-            # ---------------- lista e grade
-            self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-            self.listbox.add_css_class("boxed-list")
-            self.listbox.connect("row-activated", self.on_activate)
-            # botao direito na lista: acha a linha pela posicao do clique.
-            # Cabecalhos nao estao em self.rows, entao nao abrem menu.
-            listrc = Gtk.GestureClick()
-            listrc.set_button(3)
-            listrc.connect("pressed", self.on_list_rightclick)
-            self.listbox.add_controller(listrc)
-
+            # ---------------- grade (unica view: a lista foi removida) --
             # Grid estatico (nao GridView): o GridView nao expoe append/remove
-            # nesta versao do PyGObject, e um Grid fixo de 5 colunas e mais
-            # simples e leve -- a lista cabe na tela sem rolagem propria.
+            # nesta versao do PyGObject.
             self.grid = Gtk.Grid(column_spacing=6, row_spacing=6)
             # valign START e nao FILL: com FILL a grade esticava para
             # preencher o viewport e o GtkGrid distribuia o excedente entre
@@ -980,18 +908,13 @@ def build_gui():
             gridrc.connect("pressed", self.on_grid_rightclick)
             self.grid.add_controller(gridrc)
 
-            self.stack = Gtk.Stack()
-            self.stack.add_named(self.listbox, "list")
-            self.stack.add_named(self.grid, "grid")
-            self.stack.set_visible_child_name("grid" if cfg.get("view") == "grid" else "list")
-
             margin = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             margin.set_margin_bottom(8)
             margin.set_margin_start(8)
             margin.set_margin_end(8)
             self.scroll = Gtk.ScrolledWindow(vexpand=True)
             self.scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-            self.scroll.set_child(self.stack)
+            self.scroll.set_child(self.grid)
             margin.append(self.scroll)
             root.append(margin)
 
@@ -1003,10 +926,8 @@ def build_gui():
 
             self.set_child(root)
 
-            self.rows = {}
-            self.grid_items = {}
-            self.web_refs = []   # (widget, container) so da web, p/ recarregar limpo
-            self.headers = []     # cabecalhos de secao, p/ clear() tirar
+            self.items = {}      # celula -> item (grade unica)
+            self.web = set()       # celulas da web, para o clear_web tirar
             self._web_busy = False # trava R durante o fetch
             self._width = 0
             self._tray = None
@@ -1183,51 +1104,9 @@ def build_gui():
             name = self.rotator.next()
             self.say(f"aplicado: {name}" if name else "falhou", warn=name is None)
 
-        def on_view_toggle(self, btn):
-            mode = "grid" if btn.get_active() else "list"
-            if mode == self.stack.get_visible_child_name():
-                return
-            self.cfg["view"] = mode
-            save_config(self.cfg)
-            self.stack.set_visible_child_name(mode)   # rebuild le o modo novo
-            self.rebuild()
-
-        def rebuild(self):
-            """Redesenha tudo no container do modo atual.
-
-            Inverter o Stack sozinho nao move nada: cada item foi criado num
-            ListBox ou num Grid conforme o modo da hora. Entao juntamos tudo
-            Numa lista unica, limpamos e recriamos.
-
-            A ordem de exibicao e sempre local -> web, independente do modo.
-            """
-            # junta tudo sem repetir: o mesmo item pode estar em rows E em
-            # grid_items se algum caminho antigo nao limpou
-            merged, seen = [], set()
-            for src in (list(self.rows.values()) + list(self.grid_items.values())):
-                if id(src) not in seen:
-                    seen.add(id(src))
-                    merged.append(src)
-
-            ordered = ([i for i in merged if i["kind"] == "local"]
-                       + [i for i in merged if i["kind"] == "web"])
-
-            self.clear()
-            for it in ordered:
-                badge = it.get("badge") or None
-                if it["kind"] == "local":
-                    badge = None
-                self.add_item(self._pix_for(it), it.get("label", ""),
-                              it.get("sub", ""), badge, it)
-            if self.stack.get_visible_child_name() == "grid":
-                self.resize_grid()      # posiciona tudo de uma vez
-            return len(ordered)
-
         def on_key(self, _c, keyval, _k, _m, _state=None):
             if keyval in (ord("R"), ord("r")):
                 self.load_web()
-            elif keyval in (ord("V"), ord("v")):
-                self.view_btn.set_active(not self.view_btn.get_active())
             elif keyval in (ord("N"), ord("n")):
                 self.on_next()
             elif keyval == ord("q") and _m & 4:  # Ctrl+Q
@@ -1335,20 +1214,14 @@ def build_gui():
 
             # ---------------- lista / grade
         def clear(self):
-            for row in self.rows:
-                self.listbox.remove(row)
-            for h in self.headers:
-                self.listbox.remove(h)
-            for cell in self.grid_items:
+            for cell in self.items:
                 # so remove o que foi realmente anexado: entre o add_item e
                 # o resize_grid a celula esta registrada mas ainda sem pai,
                 # e o GTK reclama com um gtk_grid_remove assertion
                 if cell.get_parent() is not None:
                     self.grid.remove(cell)
-            self.rows.clear()
-            self.headers.clear()
-            self.grid_items.clear()
-            self.web_refs.clear()
+            self.items.clear()
+            self.web.clear()
             self._ncols = GRID_COLS_DEFAULT
             self._cell_geom = None
             self._laid_out = -1
@@ -1363,61 +1236,41 @@ def build_gui():
             locais em 3 colunas finas a esquerda e a web em 6 no resto.
             """
             n = self._ncols
-            for pos, cell in enumerate(list(self.grid_items)):
+            for pos, cell in enumerate(list(self.items)):
                 if cell.get_parent() is self.grid:
                     self.grid.remove(cell)
                 self.grid.attach(cell, pos % n, pos // n, 1, 1)
 
         def clear_web(self):
-            """Remove as linhas da web e seu cabecalho, preservando as locais."""
-            # na grade qualquer remocao desloca as posicoes: reconstroi
-            if self.stack.get_visible_child_name() == "grid":
-                self.rebuild()
+            """Tira as celulas da web e re-densa a grade. Sem rebuild e sem
+            duplicar: a web velha sai aqui, a nova entra no _web_done."""
+            if not self.web:
                 return
-            for widget, _c in self.web_refs:
-                self.listbox.remove(widget)
-                self.rows.pop(widget, None)
-            self.web_refs.clear()
-            # o cabecalho "Wallhaven 18+" e das web: sai junto
-            for h in [h for h in self.headers if h.is_web_header]:
-                self.listbox.remove(h)
-                self.headers.remove(h)
-
-        def add_header(self, text, is_web=False):
-            # registra em self.headers: antes os cabecalhos nao entravam em
-            # nenhuma lista e clear() nunca os removia, entao eles se
-            # acumulavam a cada R (2 -> 12 cabecalhos em 10 refreshes)
-            h = Header(text, is_web)
-            self.listbox.append(h)
-            self.headers.append(h)
+            for cell in self.web:
+                if cell.get_parent() is not None:
+                    self.grid.remove(cell)
+                self.items.pop(cell, None)
+            self.web.clear()
+            self.resize_grid()
 
         def add_item(self, pixbuf, title, subtitle, badge, item):
-            """Coloca o item no container visivel e o registra.
+            """Registra o item e cria a celula (anexada por resize_grid).
 
-            title/subtitle/badge sao guardados no proprio item para que o
-            rebuild (troca lista<->grade) nao perca o texto.
+            title/subtitle/badge ficam guardados no proprio item.
             """
             item["label"] = title
             item["sub"] = subtitle
             item["badge"] = badge
             if pixbuf is not None:
-                item["_pb"] = pixbuf      # sobrevive a troca lista<->grade
-            if self.stack.get_visible_child_name() == "grid":
-                cell = GridCell(pixbuf, badge)
-                cell.item = item
-                # nao anexa aqui: resize_grid()/_relayout() posiciona tudo
-                # de uma vez no fim do lote, com um ncols so
-                self.grid_items[cell] = item
-                if item["kind"] == "web":
-                    self.web_refs.append((cell, self.grid))
-                return cell
-            row = Row(pixbuf, title, subtitle, badge)
-            row.item = item
-            self.listbox.append(row)
-            self.rows[row] = item
+                item["_pb"] = pixbuf
+            cell = GridCell(pixbuf, badge)
+            cell.item = item
+            # nao anexa aqui: resize_grid()/_relayout() posiciona tudo de
+            # uma vez no fim do lote, com um ncols so
+            self.items[cell] = item
             if item["kind"] == "web":
-                self.web_refs.append((row, self.listbox))
-            return row
+                self.web.add(cell)
+            return cell
 
         def resize_grid(self):
             """Celulas em 21:9 (mais larga que alta), colunas responsivas.
@@ -1436,13 +1289,13 @@ def build_gui():
             if w <= 0 or h <= 0:
                 # ainda nao alocada: usa a largura real do stack, que ja
                 # tem o tamanho do viewport, e nao o clamp de 160
-                w = self.stack.get_width() or 0
-                h = self.stack.get_height() or 0
+                w = self.scroll.get_width() or 0
+                h = self.scroll.get_height() or 0
             if w <= 0 or h <= 0:
                 return self._ncols, 0, 0
             avail_w = max(160, w - 40)
             avail_h = max(120, h - 190)
-            n = len(self.grid_items)
+            n = len(self.items)
             if not n:
                 return 0, 0, 0
 
@@ -1472,9 +1325,9 @@ def build_gui():
             # fazia detach+attach de todas as celulas mesmo sem mudanca, e
             # durante um arraste isso empilhava layouts atras do compositor.
             if (ncols, int(cw), ch) == self._cell_geom and n == self._laid_out:
-                if all(c.get_parent() is self.grid for c in self.grid_items):
+                if all(c.get_parent() is self.grid for c in self.items):
                     return ncols, int(cw), ch
-            for cell in self.grid_items:
+            for cell in self.items:
                 # so altura, sem largura: a largura vem do hexpand (divisao
                 # igual do viewport). Com largura minima a grade pedia
                 # ~1350px de min-width, o ScrolledWindow propagava e a janela
@@ -1503,10 +1356,9 @@ def build_gui():
             return self.add_item(pb, f.name, f"{kb} KB", None, item)
 
         def load_local(self, folder):
+            # sem cabecalho: na grade unica nao ha titulos de secao, os
+            # locais ficam em cima (ordem de insercao) e a web tem badge
             files = scan_folder(folder)
-            if not files:
-                return 0
-            self.add_header(f"Local  ·  {len(files)} imagem(ns) em {folder}")
             for f in files:
                 self._add_local_file(f)
             return len(files)
@@ -1515,8 +1367,7 @@ def build_gui():
             """Traz para a lista os arquivos que apareceram na pasta depois
             do load -- e o que acontece quando um download termina. Nao
             recarrega nada: so anexa o que ainda nao esta la."""
-            have = {it["path"] for it in
-                    {**self.rows, **self.grid_items}.values()
+            have = {it["path"] for it in self.items.values()
                     if it["kind"] == "local"}
             added = 0
             for f in scan_folder(folder):
@@ -1525,15 +1376,20 @@ def build_gui():
                     added += 1
             if not added:
                 return 0
-            # se a pasta estava vazia nao havia cabecalho "Local"
-            if not any(not h.is_web_header for h in self.headers):
-                self.add_header(f"Local  ·  {len(scan_folder(folder))} imagem(ns) em {folder}")
-            if self.stack.get_visible_child_name() == "grid":
-                self.resize_grid()
+            self.resize_grid()
             self.rotator.folder = str(folder)
             self.rotator.rescan()
             self.sync_rotate_ui()
             return added
+
+        def _reveal_item(self, path):
+            """Rola ate o item para ele aparecer na tela. Sem isso um arquivo
+            adotado no meio da ordem alfabetica entra invisivel (ex.: p28ojm
+            entre os 'o' e 'pog8rj') e parece que nao entrou."""
+            for widget, it in self.items.items():
+                if it["kind"] == "local" and it["path"] == str(path):
+                    widget.grab_focus()
+                    break
 
         def _load_local(self, f):
             """Miniatura local do cache em disco, ou None se ainda nao existe."""
@@ -1557,7 +1413,7 @@ def build_gui():
             """Salva a miniatura via .tmp + os.replace.
 
             Sem isso, dois workers do mesmo arquivo (um disparado por
-            _pix_for durante um rebuild, antes do primeiro terminar) escrevem
+            _pix_for durante uma recarga, antes do primeiro terminar) escrevem
             no mesmo caminho e um JPEG pela metade passa na validacao de
             tamanho (>1000 bytes) como se estivesse inteiro.
             """
@@ -1649,8 +1505,6 @@ def build_gui():
                          warn=True)
                 return False
 
-            if self.stack.get_visible_child_name() == "list":
-                self.add_header(f"Wallhaven 18+  ·  {len(data)} wallpaper(s)", is_web=True)
             for w in data:
                 item = {"kind": "web", "w": w}
                 w["_item_ref"] = item          # o worker acha o item por ele
@@ -1660,11 +1514,10 @@ def build_gui():
                 self.add_item(pb, w["id"],
                               f"{w.get('resolution', '?')} · {w.get('file_size', 0) // 1024} KB",
                               w.get("purity", ""), item)
-            if self.stack.get_visible_child_name() == "grid":
-                self.resize_grid()
+            self.resize_grid()
             n_sfw = sum(1 for w in data if w["purity"] == "nsfw")
             self.say(f"{len(data)} da web ({n_sfw} nsfw, {len(data) - n_sfw} sketchy)"
-                     f" · R sorteia · V troca a view")
+                     f" · R sorteia · N proximo · Enter aplica")
             return False
 
         def _load_thumb(self, w):
@@ -1693,17 +1546,14 @@ def build_gui():
             Python recicla endereco de dict e a auditoria mediu 48% dos dicts
             de um lote novo caindo no endereco de um dict morto do anterior.
             Com id(), um worker atrasado pintava a celula errada e ainda
-            gravava o _pb errado, que persistia ate o proximo rebuild.
+            gravava o _pb errado, que persistia ate a proxima recarga.
             """
             if item is None:
                 return False
-            for widget, it in {**self.rows, **self.grid_items}.items():
+            for widget, it in self.items.items():
                 if it is item:
                     item["_pb"] = pb
-                    if isinstance(widget, GridCell):
-                        widget.set_pixbuf(pb)
-                    else:
-                        widget.get_child().get_first_child().set_paintable(paintable(pb))
+                    widget.set_pixbuf(pb)
                     break
             return False
 
@@ -1715,10 +1565,9 @@ def build_gui():
             self.clear()
 
             n_local = self.load_local(folder)
-            # no modo grade as celulas so sao anexadas por resize_grid;
-            # sem esta chamada a grade ficava em branco ao apertar "Abrir"
-            if self.stack.get_visible_child_name() == "grid":
-                self.resize_grid()
+            # as celulas so sao anexadas por resize_grid; sem esta chamada
+            # a grade ficava em branco ao apertar "Abrir"
+            self.resize_grid()
             # a mensagem de pasta vazia nao pode ser sobrescrita em seguida
             # por "sem API key" (a causa real sumia da tela)
             msg = (f"{n_local} local(is)" if n_local
@@ -1790,24 +1639,17 @@ def build_gui():
 
         def _remove_deleted(self, folder):
             """Tira da lista os locais cujos arquivos sumiram do disco."""
-            gone = [w for w, it in {**self.rows, **self.grid_items}.items()
+            gone = [w for w, it in self.items.items()
                     if it["kind"] == "local"
                     and not pathlib.Path(it["path"]).exists()]
             for w in gone:
-                if w in self.rows:
-                    self.listbox.remove(w)
-                    del self.rows[w]
-                elif w in self.grid_items:
-                    if w.get_parent() is not None:
-                        self.grid.remove(w)
-                    del self.grid_items[w]
-            if gone and self.stack.get_visible_child_name() == "grid":
+                if w.get_parent() is not None:
+                    self.grid.remove(w)
+                del self.items[w]
+                self.web.discard(w)
+            if gone:
                 self.resize_grid()
             return len(gone)
-
-        def on_activate(self, _lb, row):
-            if item := self.rows.get(row):
-                self.apply(item)
 
         def on_grid_click(self, gesture, n_press, x, y):
             if n_press != 1:
@@ -1816,29 +1658,23 @@ def build_gui():
             # Overlay), nao a celula. Sem subir ate o pai, o clique nunca
             # encontra o item e a grade fica sem resposta nenhuma.
             node = self.grid.pick(x, y, Gtk.PickFlags.DEFAULT)
-            while node is not None and node not in self.grid_items:
+            while node is not None and node not in self.items:
                 node = node.get_parent()
             if node is None:
                 return
-            if item := self.grid_items.get(node):
+            if item := self.items.get(node):
                 self.apply(item)
 
         def _grid_item_at(self, x, y):
             """Acha a celula sob o cursor, subindo do filho mais profundo."""
             node = self.grid.pick(x, y, Gtk.PickFlags.DEFAULT)
-            while node is not None and node not in self.grid_items:
+            while node is not None and node not in self.items:
                 node = node.get_parent()
-            return self.grid_items.get(node)
+            return self.items.get(node)
 
         def on_grid_rightclick(self, gesture, n_press, x, y):
             if item := self._grid_item_at(x, y):
                 self.show_ctx_menu(self.grid, x, y, item)
-
-        def on_list_rightclick(self, gesture, n_press, x, y):
-            row = self.listbox.get_row_at_y(y)
-            item = self.rows.get(row) if row is not None else None
-            if item is not None:
-                self.show_ctx_menu(self.listbox, x, y, item)
 
         def show_ctx_menu(self, widget, x, y, item):
             """Menu de botao direito. So abre nos itens da web.
@@ -1968,10 +1804,12 @@ def build_gui():
             GLib.idle_add(self._downloaded, dest, folder)
 
         def _downloaded(self, dest, folder):
-            """Arquivo chegou: avisa onde salvou e anexa na lista local."""
+            """Arquivo chegou: avisa onde salvou, anexa e mostra."""
             n = self._adopt_new(folder)
             self.say(f"baixado: {dest.name}  →  {folder}"
                      + ("" if n else " (ja estava na lista)"))
+            if n:
+                self._reveal_item(dest)
             return False
 
         def _apply_web(self, w):
@@ -2012,8 +1850,6 @@ def build_gui():
 
         def do_size_allocate(self, *a):  # noqa: N802
             Gtk.ApplicationWindow.do_size_allocate(self, *a)
-            if self.stack.get_visible_child_name() != "grid":
-                return
             w = self.get_width()
             if not w or abs(w - self._width) <= 4:
                 return
@@ -2035,8 +1871,6 @@ def build_gui():
         def _deferred_resize(self):
             """Um tiro so: recalcula com a largura ja assentada."""
             self._resize_id = None
-            if self.stack.get_visible_child_name() != "grid":
-                return False
             self._width = self.get_width() or self._width
             self.resize_grid()
             return False
@@ -2106,7 +1940,6 @@ def main():
     if "--status" in argv:
         print(f"pasta     : {cfg['folder'] or '(vazia)'}")
         print(f"imagens   : {len(scan_folder(cfg['folder']))}")
-        print(f"view      : {cfg['view']}")
         print(f"rotacao   : {'ligada' if cfg['rotate'] else 'desligada'} "
               f"a cada {human_time(cfg['interval'])}")
         print(f"boot      : {boot_status()}")
