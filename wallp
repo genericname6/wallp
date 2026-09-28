@@ -838,11 +838,6 @@ def build_gui():
             # ---------------- barra
             hb = Gtk.HeaderBar()
 
-            reload_btn = Gtk.Button(icon_name="view-refresh-symbolic")
-            reload_btn.set_tooltip_text("Sortear outros da web (R)")
-            reload_btn.connect("clicked", lambda *_: self.load_web())
-            hb.pack_end(reload_btn)
-
             next_btn = Gtk.Button(icon_name="media-playback-start-symbolic")
             next_btn.set_tooltip_text("Proximo wallpaper da pasta (N)")
             next_btn.connect("clicked", lambda *_: self.on_next())
@@ -865,28 +860,25 @@ def build_gui():
             self.clock_btn.set_popover(self.build_popover())
             hb.pack_end(self.clock_btn)
 
-            title = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-            logo = Gtk.Image.new_from_icon_name(ICON_NAME)
-            logo.set_pixel_size(20)
-            title.append(logo)
-            title.append(Gtk.Label(label="wallp"))
-            hb.set_title_widget(title)
-            root.append(hb)
-
-            # ---------------- a unica opcao: caminho da pasta
-            top = pad(Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6),
-                      top=8, bottom=6, start=8, end=8)
-            top.append(Gtk.Label(label="Pasta"))
+            # A unica opcao (caminho da pasta) mora no centro do cabecalho,
+            # no lugar do nome/logo redundante ("wallp" ja esta no titulo da
+            # janela). A fileira de baixo sumiu e virou altura de grade.
+            title = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            title.set_hexpand(True)
+            title.append(Gtk.Label(label="Pasta"))
             self.entry = Gtk.Entry(hexpand=True, placeholder_text="~/Imagens/wallpapers")
             self.entry.set_text(cfg.get("folder", ""))
             self.entry.connect("activate", lambda *_: self.load())
-            top.append(self.entry)
+            title.append(self.entry)
+            # reload UNICO: recarrega pasta + web. O so-da-web saiu do mouse
+            # (a tecla R continua sorteando a web) para nao ter dois ↻.
             btn = Gtk.Button(icon_name="view-refresh-symbolic")
             btn.set_tooltip_text("Recarregar (pasta + web)")
             btn.add_css_class("suggested-action")
             btn.connect("clicked", lambda *_: self.load())
-            top.append(btn)
-            root.append(top)
+            title.append(btn)
+            hb.set_title_widget(title)
+            root.append(hb)
 
             # ---------------- grade (unica view: a lista foi removida) --
             # Grid estatico (nao GridView): o GridView nao expoe append/remove
