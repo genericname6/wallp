@@ -63,6 +63,10 @@ THUMB_W, THUMB_H = 96, 96
 
 ICON_NAME = "io.wallp.App"   # ~/.local/share/icons/hicolor/scalable/apps/
 
+# pasta padrao do download (botao direito): usada quando o campo do topo
+# esta vazio. Criada automaticamente no primeiro download.
+DEFAULT_FOLDER = pathlib.Path.home() / "Pictures" / "wallpapers"
+
 # celula da grade: 21 de LARGURA por 9 de ALTURA (paisagem/ultrawide, mais larga
 # que alta). 21/9 = 2.33.
 GRID_RATIO = 21 / 9
@@ -320,11 +324,38 @@ def fetch_full(w):
     if dest.exists() and dest.stat().st_size > 1000:
         return dest
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(_get_bytes(w["path"], timeout=180))
+    return dest
+
+
+def _get_bytes(url, timeout):
+    """Baixa uma URL inteira. Sem limite de tamanho: um PNG 4K+ passa
+    facil de 100 MB -- e o chamador que decide onde vai parar."""
     req = urllib.request.Request(
-        w["path"], headers={"User-Agent": "wallp/1.0", "Referer": "https://wallhaven.cc/"}
+        url, headers={"User-Agent": "wallp/1.0", "Referer": "https://wallhaven.cc/"}
     )
-    with urllib.request.urlopen(req, timeout=180) as r:
-        dest.write_bytes(r.read())
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def unique_path(folder, stem, suffix):
+    """wallhaven-abc.jpg, ou -1, -2... se ja existir. Nunca sobrescreve."""
+    dest = folder / f"{stem}{suffix}"
+    if not dest.exists():
+        return dest
+    i = 1
+    while True:
+        cand = folder / f"{stem}-{i}{suffix}"
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+def download_wallpaper(w, folder):
+    """Baixa o original para a pasta, com sufixo se o nome ja existir."""
+    dest = unique_path(folder, f"wallhaven-{w['id']}",
+                       pathlib.Path(w["path"]).suffix)
+    dest.write_bytes(_get_bytes(w["path"], timeout=180))
     return dest
 
 
@@ -587,7 +618,7 @@ def build_gui():
     gi.require_version("Gtk", "4.0")
     gi.require_version("Gdk", "4.0")
     gi.require_version("GdkPixbuf", "2.0")
-    from gi.repository import Gdk, GdkPixbuf, Gtk  # noqa: E402
+    from gi.repository import Gdk, GdkPixbuf, Gio, Gtk  # noqa: E402
 
     def paintable(pb):
         if pb is None:
@@ -839,6 +870,12 @@ def build_gui():
             self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
             self.listbox.add_css_class("boxed-list")
             self.listbox.connect("row-activated", self.on_activate)
+            # botao direito na lista: acha a linha pela posicao do clique.
+            # Cabecalhos nao estao em self.rows, entao nao abrem menu.
+            listrc = Gtk.GestureClick()
+            listrc.set_button(3)
+            listrc.connect("pressed", self.on_list_rightclick)
+            self.listbox.add_controller(listrc)
 
             # Grid estatico (nao GridView): o GridView nao expoe append/remove
             # nesta versao do PyGObject, e um Grid fixo de 5 colunas e mais
@@ -854,6 +891,12 @@ def build_gui():
             gridcl.set_button(1)
             gridcl.connect("released", self.on_grid_click)
             self.grid.add_controller(gridcl)
+            # botao direito: menu de contexto (Baixar). So aparece nos itens
+            # da web -- os locais ja sao arquivos, nao ha o que baixar
+            gridrc = Gtk.GestureClick()
+            gridrc.set_button(3)
+            gridrc.connect("pressed", self.on_grid_rightclick)
+            self.grid.add_controller(gridrc)
 
             self.stack = Gtk.Stack()
             self.stack.add_named(self.listbox, "list")
@@ -889,6 +932,12 @@ def build_gui():
             self._cell_geom = None    # (ncols, cw, ch) aplicados por ultimo
             self._laid_out = -1       # quantas celulas o ultimo layout anexou
             self._resize_id = None    # idle de resize pendente
+            self._ctx_item = None     # item do menu de botao direito
+            self._pop = None          # popover do menu, para nao perder a ref
+
+            act = Gio.SimpleAction.new("download", None)
+            act.connect("activate", lambda *_: self.on_download_action())
+            self.add_action(act)
 
             self.ctrl = Gtk.EventControllerKey()
             self.ctrl.connect("key-pressed", self.on_key)
@@ -1356,24 +1405,53 @@ def build_gui():
             return ncols, int(cw), ch
 
         # -- local
+        def _add_local_file(self, f):
+            """Adiciona UM arquivo local a lista. Usado pelo load_local e
+            pelo _adopt_new (quando um download chega na pasta)."""
+            item = {"kind": "local", "path": str(f)}
+            pb = self._load_local(f)          # cache de disco; None = decodifica depois
+            if pb is not None:
+                item["_pb"] = pb
+            else:
+                POOL.submit(self._local_worker, f, item)
+            try:
+                kb = f.stat().st_size // 1024
+            except OSError:
+                kb = 0
+            return self.add_item(pb, f.name, f"{kb} KB", None, item)
+
         def load_local(self, folder):
             files = scan_folder(folder)
             if not files:
                 return 0
             self.add_header(f"Local  ·  {len(files)} imagem(ns) em {folder}")
             for f in files:
-                item = {"kind": "local", "path": str(f)}
-                pb = self._load_local(f)          # cache de disco; None = decodifica depois
-                if pb is not None:
-                    item["_pb"] = pb
-                else:
-                    POOL.submit(self._local_worker, f, item)
-                try:
-                    kb = f.stat().st_size // 1024
-                except OSError:
-                    kb = 0
-                self.add_item(pb, f.name, f"{kb} KB", None, item)
+                self._add_local_file(f)
             return len(files)
+
+        def _adopt_new(self, folder):
+            """Traz para a lista os arquivos que apareceram na pasta depois
+            do load -- e o que acontece quando um download termina. Nao
+            recarrega nada: so anexa o que ainda nao esta la."""
+            have = {it["path"] for it in
+                    {**self.rows, **self.grid_items}.values()
+                    if it["kind"] == "local"}
+            added = 0
+            for f in scan_folder(folder):
+                if str(f) not in have:
+                    self._add_local_file(f)
+                    added += 1
+            if not added:
+                return 0
+            # se a pasta estava vazia nao havia cabecalho "Local"
+            if not any(not h.is_web_header for h in self.headers):
+                self.add_header(f"Local  ·  {len(scan_folder(folder))} imagem(ns) em {folder}")
+            if self.stack.get_visible_child_name() == "grid":
+                self.resize_grid()
+            self.rotator.folder = str(folder)
+            self.rotator.rescan()
+            self.sync_rotate_ui()
+            return added
 
         def _load_local(self, f):
             """Miniatura local do cache em disco, ou None se ainda nao existe."""
@@ -1592,6 +1670,37 @@ def build_gui():
             if item := self.grid_items.get(node):
                 self.apply(item)
 
+        def _grid_item_at(self, x, y):
+            """Acha a celula sob o cursor, subindo do filho mais profundo."""
+            node = self.grid.pick(x, y, Gtk.PickFlags.DEFAULT)
+            while node is not None and node not in self.grid_items:
+                node = node.get_parent()
+            return self.grid_items.get(node)
+
+        def on_grid_rightclick(self, gesture, n_press, x, y):
+            if item := self._grid_item_at(x, y):
+                self.show_ctx_menu(self.grid, x, y, item)
+
+        def on_list_rightclick(self, gesture, n_press, x, y):
+            row = self.listbox.get_row_at_y(y)
+            if row is not None and (item := self.rows.get(row)):
+                self.show_ctx_menu(self.listbox, x, y, item)
+
+        def show_ctx_menu(self, widget, x, y, item):
+            """Menu de botao direito. So abre nos itens da web."""
+            if item.get("kind") != "web":
+                return
+            self._ctx_item = item
+            menu = Gio.Menu()
+            menu.append("Baixar para a pasta", "win.download")
+            pop = Gtk.PopoverMenu.new_from_model(menu)
+            pop.set_parent(widget)
+            pop.set_pointing_to(Gdk.Rectangle(x=int(x), y=int(y),
+                                              width=1, height=1))
+            pop.connect("closed", lambda p: p.unparent())
+            self._pop = pop
+            pop.popup()
+
         def _pix_for(self, item):
             """Pixbuf do item. Fica preso ao proprio item, entao sobrevive a
             varias trocas de lista<->grade.
@@ -1643,6 +1752,52 @@ def build_gui():
                 set_wallpaper(path)
             except (subprocess.CalledProcessError, OSError) as e:
                 GLib.idle_add(self.say, f"falhou: {e}", True)
+
+        def on_download_action(self):
+            """Botao direito > Baixar. So chega aqui com item da web."""
+            item = self._ctx_item
+            self._ctx_item = None
+            if not item or item.get("kind") != "web":
+                return
+            # resolve a pasta na thread principal: mexe no entry e no disco
+            try:
+                folder = self._resolve_folder()
+            except OSError as e:
+                self.say(f"falhou: {e}", True)
+                return
+            threading.Thread(target=self._download_web,
+                             args=(item["w"], folder), daemon=True).start()
+
+        def _resolve_folder(self):
+            """Pasta do topo, ou a padrao. Cria se nao existir.
+
+            Com o campo vazio, adota ~/Pictures/wallpapers: escreve no entry
+            e salva, para a lista local passar a mostrar de onde veio.
+            """
+            typed = self.entry.get_text().strip()
+            folder = pathlib.Path(typed or str(DEFAULT_FOLDER)).expanduser()
+            folder.mkdir(parents=True, exist_ok=True)
+            if not typed:
+                self.entry.set_text(str(folder))
+                self.cfg["folder"] = str(folder)
+                save_config(self.cfg)
+            return folder
+
+        def _download_web(self, w, folder):
+            GLib.idle_add(self.say, f"baixando {w['id']}...")
+            try:
+                dest = download_wallpaper(w, folder)
+            except Exception as e:  # noqa: BLE001
+                GLib.idle_add(self.say, f"falhou: {e}", True)
+                return
+            GLib.idle_add(self._downloaded, dest, folder)
+
+        def _downloaded(self, dest, folder):
+            """Arquivo chegou: avisa onde salvou e anexa na lista local."""
+            n = self._adopt_new(folder)
+            self.say(f"baixado: {dest.name}  →  {folder}"
+                     + ("" if n else " (ja estava na lista)"))
+            return False
 
         def _apply_web(self, w):
             GLib.idle_add(self.say, f"baixando {w['id']}...")
