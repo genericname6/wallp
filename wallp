@@ -497,6 +497,10 @@ class Rotator:
 UNIT = """[Unit]
 Description=wallp - rotacao automatica de wallpaper
 Documentation=file://%h/.local/share/wallp/README.md
+# limite de restarts: fica AQUI no [Unit], nao no [Service] -- no [Service]
+# o systemd ignora com "Unknown key" e a protecao nao existe
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -506,8 +510,6 @@ ExecStart=%h/.local/bin/wallp --rotate
 # processo quebra de verdade; pasta vazia e um estado legitimo.
 Restart=on-abnormal
 RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=3
 
 [Install]
 WantedBy=default.target
