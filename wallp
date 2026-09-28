@@ -20,8 +20,6 @@ Modos:
   wallp --rotate     so a rotacao, sem janela, para o systemd
 """
 
-import atexit
-import concurrent.futures
 import json
 import math
 import os
@@ -31,6 +29,7 @@ import os
 os.environ.setdefault("GSK_RENDERER", "cairo")
 
 import pathlib
+import queue
 import shutil
 import subprocess
 import tempfile
@@ -72,22 +71,43 @@ CACHE_DIR = pathlib.Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduse
 UNIT_DIR = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "systemd/user"
 UNIT_FILE = UNIT_DIR / "wallp.service"
 
-# Pool de miniaturas. Precisa ser shutdown(wait=False) ao sair: o
-# ThreadPoolExecutor guarda as threads no atexit e, como nao sao daemon, o
-# processo ficava preso esperando tarefas em andamento -- medido: 8,5 s para
-# sair com 6 downloads dormindo, e ate ~1 min com o magick (timeout=60).
-# wait=False + cancel_futures faz as pendentes serem descartadas na hora.
-POOL = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="wallp-thumb")
+class DaemonPool:
+    """Pool de N threads daemon, para as miniaturas.
+
+    ThreadPoolExecutor NAO serve aqui: o modulo concurrent.futures.threads
+    registra um atexit que faz join em todas as workers, entao o processo
+    espera o download terminar. Medido: 8,2 s para sair com 6 tarefas de 8 s,
+    e nao ha como evitar -- shutdown(wait=False, cancel_futures=True) so
+    cancela o que ainda nao comecou.
+
+    Com threads daemon o interpretador nao espera: sair e imediato. O limite
+    de 6 continua valendo, para nao abrir 130 conexoes contra o CDN.
+    """
+
+    def __init__(self, n=6):
+        self._q = queue.Queue()
+        self._lock = threading.Lock()
+        self._started = 0
+        self.n = n
+
+    def submit(self, fn, *args):
+        with self._lock:
+            if self._started < self.n:
+                self._started += 1
+                threading.Thread(target=self._worker, daemon=True,
+                                 name=f"wallp-thumb-{self._started}").start()
+        self._q.put((fn, args))
+
+    def _worker(self):
+        while True:
+            fn, args = self._q.get()
+            try:
+                fn(*args)
+            except Exception:  # noqa: BLE001  # nunca matar a thread do pool
+                pass
 
 
-def pool_shutdown():
-    try:
-        POOL.shutdown(wait=False, cancel_futures=True)
-    except (RuntimeError, TypeError, OSError):
-        pass
-
-
-atexit.register(pool_shutdown)
+POOL = DaemonPool(n=6)
 
 CSS = b"""
 .tr { font-weight: bold; font-size: 1.05em; padding: 10px 4px 2px 4px; }
@@ -339,6 +359,12 @@ class Rotator:
 
     def rescan(self):
         self.files = scan_folder(self.folder)
+        # reseta o indice: com a pasta trocada, um index antigo fazia
+        # next_name() apontar para um item que nao existe mais
+        if not self.files:
+            self.index = -1
+        else:
+            self.index %= len(self.files)
 
     # -- controle ----------------------------------------------------------
     def set_interval(self, sec):
@@ -1047,9 +1073,6 @@ def build_gui():
             self.rotator.stop()
             if self._tray:
                 GLib.idle_add(self._tray.hide)
-            # descarta as miniaturas em andamento: sem isso o processo fica
-            # preso no atexit esperando as threads do pool (ate ~1 min)
-            pool_shutdown()
             self.get_application().quit()
 
         def on_close(self, *_):
@@ -1304,6 +1327,25 @@ def build_gui():
                 return
             GLib.idle_add(self._set_item_thumb, item, pb)
 
+        def _save_thumb_atomic(self, pb, dest):
+            """Salva a miniatura via .tmp + os.replace.
+
+            Sem isso, dois workers do mesmo arquivo (um disparado por
+            _pix_for durante um rebuild, antes do primeiro terminar) escrevem
+            no mesmo caminho e um JPEG pela metade passa na validacao de
+            tamanho (>1000 bytes) como se estivesse inteiro.
+            """
+            tmp = dest.with_name(f".{dest.name}.{os.getpid()}"
+                                 f".{threading.get_ident()}.tmp")
+            try:
+                pb.savev(str(tmp), "jpeg", [], [])
+                os.replace(tmp, dest)
+            except (GLib.Error, OSError):
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
         def _decode_local(self, f, dest):
             """Abre a imagem local, com fallback quando o glycin recusa.
 
@@ -1316,7 +1358,7 @@ def build_gui():
             try:
                 pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(f), THUMB_W, THUMB_H, True)
                 if dest is not None and not dest.exists():
-                    pb.savev(str(dest), "jpeg", [], [])
+                    self._save_thumb_atomic(pb, dest)
                 return pb
             except GLib.Error:
                 pass
@@ -1417,13 +1459,16 @@ def build_gui():
             GLib.idle_add(self._set_item_thumb, w.get("_item_ref"), pb)
 
         def _set_item_thumb(self, item, pb):
-            """Pinta a miniatura assim que ela chega, sem travar a UI.
+            """Pinta a miniatura assim que ela recebe, sem travar a UI.
 
-            Recebe o proprio item, e nao id(item): o Python recicla endereco
-            de dict, e 48% dos dicts de um lote novo caem no endereco de um
-            dict morto do lote anterior. Com id, um worker atrasado pintava a
-            imagem na celula errada e ainda gravava o _pb errado.
+            Recebe o proprio item e compara com `is`, nunca com id(item): o
+            Python recicla endereco de dict e a auditoria mediu 48% dos dicts
+            de um lote novo caindo no endereco de um dict morto do anterior.
+            Com id(), um worker atrasado pintava a celula errada e ainda
+            gravava o _pb errado, que persistia ate o proximo rebuild.
             """
+            if item is None:
+                return False
             for widget, it in {**self.rows, **self.grid_items}.items():
                 if it is item:
                     item["_pb"] = pb
