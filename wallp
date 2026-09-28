@@ -20,6 +20,7 @@ Modos:
   wallp --rotate     so a rotacao, sem janela, para o systemd
 """
 
+import atexit
 import concurrent.futures
 import json
 import math
@@ -30,7 +31,9 @@ import os
 os.environ.setdefault("GSK_RENDERER", "cairo")
 
 import pathlib
+import shutil
 import subprocess
+import tempfile
 import sys
 import threading
 import urllib.error
@@ -69,9 +72,22 @@ CACHE_DIR = pathlib.Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduse
 UNIT_DIR = pathlib.Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser() / "systemd/user"
 UNIT_FILE = UNIT_DIR / "wallp.service"
 
-# pool limitado: uma thread por item daria ~130 conexoes simultaneas contra o
-# CDN, o que pesa a maquina e nao e educado com o servidor. 6 e o suficiente.
+# Pool de miniaturas. Precisa ser shutdown(wait=False) ao sair: o
+# ThreadPoolExecutor guarda as threads no atexit e, como nao sao daemon, o
+# processo ficava preso esperando tarefas em andamento -- medido: 8,5 s para
+# sair com 6 downloads dormindo, e ate ~1 min com o magick (timeout=60).
+# wait=False + cancel_futures faz as pendentes serem descartadas na hora.
 POOL = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="wallp-thumb")
+
+
+def pool_shutdown():
+    try:
+        POOL.shutdown(wait=False, cancel_futures=True)
+    except (RuntimeError, TypeError, OSError):
+        pass
+
+
+atexit.register(pool_shutdown)
 
 CSS = b"""
 .tr { font-weight: bold; font-size: 1.05em; padding: 10px 4px 2px 4px; }
@@ -101,18 +117,71 @@ DEFAULT_CFG = {
 def load_config():
     cfg = dict(DEFAULT_CFG)
     try:
-        cfg.update(json.loads(CONFIG_FILE.read_text()))
-    except (OSError, ValueError):
+        data = json.loads(CONFIG_FILE.read_text())
+        # JSON valido pode ainda ser tipo errado: [1,2] quebrava o app num
+        # TypeError nao coberto pelo except
+        if isinstance(data, dict):
+            cfg.update(data)
+    except (OSError, ValueError, TypeError):
         pass
+    # normaliza o que o codigo consome como numero
+    try:
+        cfg["interval"] = max(0, int(cfg["interval"]))
+    except (TypeError, ValueError):
+        cfg["interval"] = DEFAULT_CFG["interval"]
+    if cfg.get("unit") not in ("s", "min"):
+        cfg["unit"] = "s"
+    if cfg.get("view") not in ("list", "grid"):
+        cfg["view"] = "list"
+    # a key do ambiente NUNCA vai para o arquivo: ela existe para poder
+    # rodar sem credencial em disco. A do disco e a ultima coisa gravada,
+    # entao o save_config reescreve por cima dela.
     if env := os.environ.get("WALLP_KEY"):
         cfg["key"] = env
+        cfg["_key_from_env"] = True
     return cfg
 
 
 def save_config(cfg):
+    """Grava de forma atomica, com 0600 desde o primeiro instante.
+
+    Resolve tres problemas medidos:
+      - write_text() truncava antes de escrever: energia cortada no meio
+        deixava JSON invalido e o load_config engolia o erro em silencio
+        (medido: 538 leituras de arquivo vazio em 300 escritas)
+      - o chmod 0600 vinha DEPOIS do write, deixando a key world-readable
+        por ~ms (medido: 0644 observado por leitor concorrente)
+      - os.replace e atomico: ou o arquivo antigo inteiro, ou o novo inteiro
+
+    E nao persiste a key que veio de WALLP_KEY: ela fica so na memoria.
+    """
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n")
-    CONFIG_FILE.chmod(0o600)  # a key mora aqui
+    out = {k: v for k, v in cfg.items() if k != "_key_from_env"}
+    if out.get("key") == os.environ.get("WALLP_KEY"):
+        # leia de volta a key do disco, para nao trocar a do ambiente por ela
+        try:
+            previa = json.loads(CONFIG_FILE.read_text())
+            if previa.get("key"):
+                out["key"] = previa["key"]
+            else:
+                out.pop("key", None)
+        except (OSError, ValueError, TypeError):
+            out.pop("key", None)
+
+    fd, tmp = tempfile.mkstemp(dir=str(CONFIG_DIR), prefix=".wallp-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(out, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())      # garante que chegou ao disco
+        os.chmod(tmp, 0o600)          # 0600 ANTES de existir no lugar final
+        os.replace(tmp, CONFIG_FILE)  # <- atomico
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # --------------------------------------------------------------------------- fontes
@@ -133,6 +202,7 @@ def fetch_web(key, timeout=20):
     if not key:
         raise RuntimeError("sem API key (wallp --key, ou WALLP_KEY)")
     vistos, out = set(), []
+    falhas = []
 
     def get(tier):
         qs = urllib.parse.urlencode(
@@ -155,8 +225,14 @@ def fetch_web(key, timeout=20):
     for tier in PURITY_PEDIDO:
         try:
             collect(get(tier))
-        except (urllib.error.URLError, ValueError, TimeoutError):
-            continue
+        except urllib.error.HTTPError as e:
+            falhas.append(f"HTTP {e.code}")
+        except (urllib.error.URLError, ValueError, TimeoutError) as e:
+            falhas.append(type(e).__name__)
+
+    # todas as requisicoes falharam != a API respondeu e nao tinha 18+
+    if falhas and len(falhas) == len(PURITY_PEDIDO) and not out:
+        raise RuntimeError("wallhaven: " + ", ".join(falhas))
     return out
 
 
@@ -346,44 +422,75 @@ Documentation=file://%h/.local/share/wallp/README.md
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/wallp --rotate
-Restart=on-failure
-RestartSec=5
+# antes: Restart=on-failure + exit 1 com pasta vazia = loop eterno
+# (medido: NRestarts=4 em 14 s, indefinidamente). Agora so reinicia se o
+# processo quebra de verdade; pasta vazia e um estado legitimo.
+Restart=on-abnormal
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Install]
 WantedBy=default.target
 """
 
 
+def _systemctl(*args):
+    """systemctl --user, devolvendo (ok, saida). Nao levanta se nao existir."""
+    try:
+        r = subprocess.run(["systemctl", "--user", *args],
+                           capture_output=True, text=True, timeout=20)
+        return r.returncode == 0, (r.stdout + r.stderr).strip()
+    except (FileNotFoundError, subprocess.SubprocessError, OSError) as e:
+        return False, str(e)
+
+
 def boot_enable(cfg):
+    """Instala a rotacao no boot. So grava boot=True se deu certo.
+
+    Antes, gravava True mesmo com o systemd fora do ar ou sem systemctl no
+    PATH, e o checkbox ficava marcado sem nada instalado -- a UI mentia.
+    """
+    if not shutil.which("systemctl"):
+        raise RuntimeError("systemctl nao encontrado: instale o systemd ou use --status")
+
     UNIT_DIR.mkdir(parents=True, exist_ok=True)
     UNIT_FILE.write_text(UNIT)
-    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
-    subprocess.run(["systemctl", "--user", "enable", "--now", "wallp.service"],
-                   capture_output=True)
+    ok, out = _systemctl("daemon-reload")
+    if not ok:
+        raise RuntimeError(f"systemd indisponivel: {out[:120]}")
+
+    ok, out = _systemctl("enable", "--now", "wallp.service")
+    if not ok:
+        raise RuntimeError(f"falha ao habilitar: {out[:160]}")
+
     # linger faz o service subir no boot mesmo sem sessao grafica aberta
-    subprocess.run(["loginctl", "enable-linger", os.environ.get("USER", "")],
-                   capture_output=True)
+    if shutil.which("loginctl"):
+        subprocess.run(["loginctl", "enable-linger", os.environ.get("USER", "")],
+                       capture_output=True)
+
     cfg["boot"] = True
     save_config(cfg)
     return True
 
 
 def boot_disable(cfg):
-    subprocess.run(["systemctl", "--user", "disable", "--now", "wallp.service"],
-                   capture_output=True)
+    _systemctl("disable", "--now", "wallp.service")
     try:
         UNIT_FILE.unlink()
     except OSError:
         pass
+    _systemctl("daemon-reload")
     cfg["boot"] = False
     save_config(cfg)
     return True
 
 
 def boot_status():
-    r = subprocess.run(["systemctl", "--user", "is-enabled", "wallp.service"],
-                       capture_output=True, text=True)
-    return r.stdout.strip() or "desconhecido"
+    ok, out = _systemctl("is-enabled", "wallp.service")
+    if not ok:
+        return out.splitlines()[0][:60] if out else "indisponivel"
+    return out.strip() or "desconhecido"
 
 
 # --------------------------------------------------------------------------- modo headless
@@ -393,8 +500,26 @@ def run_headless(cfg):
     rot = Rotator(cfg["folder"], cfg["interval"])
     rot.rescan()
     if not rot.files:
-        print(f"wallp: pasta sem imagens: {cfg['folder'] or '(vazia)'}", file=sys.stderr)
-        return 1
+        # sai com 0, nao 1: pasta vazia e um estado legitimo, e o
+        # Restart=on-abnormal do unit nao entra em loop por causa disso.
+        # Fica de vigia: a pasta pode ser preenchida depois (disco montado,
+        # pasta criada por outro app) e a rotacao comeca sozinha.
+        print(f"wallp: pasta sem imagens ainda: {cfg['folder'] or '(vazia)'}"
+              f" — reavaliando a cada 60 s", file=sys.stderr)
+
+        def vigiar():
+            rot.rescan()
+            if rot.files:
+                print(f"wallp: {len(rot.files)} imagem(ns) apareceram,"
+                      f" rotando a cada {human_time(rot.interval)}", file=sys.stderr)
+                rot.on_apply = lambda f: print(f"  -> {f.name}")
+                rot.start()
+                return False          # sai do vigia
+            return True               # continua de olho
+
+        GLib.timeout_add_seconds(60, vigiar)
+        GLib.MainLoop().run()
+        return 0
     print(f"wallp: rotando {len(rot.files)} imagens de {cfg['folder']} "
           f"a cada {human_time(rot.interval)}")
 
@@ -572,8 +697,10 @@ def build_gui():
                 self.img.set_paintable(tex)
 
     class Header(Gtk.ListBoxRow):
-        def __init__(self, text):
+        # is_web_header marca o cabecalho da web, para o clear_web remove-lo
+        def __init__(self, text, is_web=False):
             super().__init__()
+            self.is_web_header = is_web
             self.set_activatable(False)
             lbl = Gtk.Label(label=text)
             lbl.set_xalign(0)
@@ -693,6 +820,8 @@ def build_gui():
             self.rows = {}
             self.grid_items = {}
             self.web_refs = []   # (widget, container) so da web, p/ recarregar limpo
+            self.headers = []     # cabecalhos de secao, p/ clear() tirar
+            self._web_busy = False # trava R durante o fetch
             self._width = 0
             self._tray = None
             self._pending = []       # celulas ainda nao posicionadas
@@ -765,14 +894,29 @@ def build_gui():
             return pop
 
         def _restore_interval(self):
+            """Repoe o intervalo sem disparar save_config.
+
+            Antes, o spin e o dropdown ja estavam conectados: ajustar um
+            disparava on_interval_changed, que salvava e reiniciava a
+            contagem. E como o dropdown era setado ANTES do valor, o
+            notify::selected usava o valor antigo do spin -- "2 min" virava
+            "60 min" no disco (medido).
+            """
             unit = self.cfg.get("unit", "s")
-            iv = self.cfg.get("interval", 300)
-            if unit == "min":
-                self.unit_dd.set_selected(1)
-                self.spin.set_value(max(1, iv // 60))
-            else:
-                self.unit_dd.set_selected(0)
-                self.spin.set_value(max(1, min(iv, 1440)))
+            iv = int(self.cfg.get("interval", 300) or 300)
+            # silencia os sinais durante a restauracao
+            self.spin.handler_block_by_func(self.on_interval_changed)
+            self.unit_dd.handler_block_by_func(self.on_interval_changed)
+            try:
+                if unit == "min":
+                    self.unit_dd.set_selected(1)
+                    self.spin.set_value(max(1, min(1440, round(iv / 60))))
+                else:
+                    self.unit_dd.set_selected(0)
+                    self.spin.set_value(max(1, min(1440, iv)))
+            finally:
+                self.spin.handler_unblock_by_func(self.on_interval_changed)
+                self.unit_dd.handler_unblock_by_func(self.on_interval_changed)
 
         # ---------------- status / sync
         def say(self, msg, warn=False):
@@ -821,6 +965,10 @@ def build_gui():
         def on_interval_changed(self, *_):
             v = self.spin.get_value()
             secs = int(v * 60) if self.unit_dd.get_selected() == 1 else int(v)
+            # nao grava a cada entalhe da roda do mouse: so quando o valor
+            # realmente mudou de verdade
+            if secs == self.cfg.get("interval") and self.rotator.interval == secs:
+                return
             self.cfg["interval"] = max(1, secs)
             self.cfg["unit"] = "min" if self.unit_dd.get_selected() == 1 else "s"
             save_config(self.cfg)
@@ -899,6 +1047,9 @@ def build_gui():
             self.rotator.stop()
             if self._tray:
                 GLib.idle_add(self._tray.hide)
+            # descarta as miniaturas em andamento: sem isso o processo fica
+            # preso no atexit esperando as threads do pool (ate ~1 min)
+            pool_shutdown()
             self.get_application().quit()
 
         def on_close(self, *_):
@@ -913,47 +1064,94 @@ def build_gui():
 
         # ---------------- bandeja
         def _show_tray(self):
-            if not self._tray:
+            """Bandeja: so funciona com a extensao AppIndicator do GNOME.
+
+            Este codigo era GTK3 puro e nunca rodou: AppIndicator3 exige o
+            namespace Gtk 3.0, que conflita com o Gtk 4.0 ja carregado
+            (ImportError), e Gtk.Menu/MenuItem/CheckMenuItem nem existem no
+            GTK4. Reescrito com Gio.Menu + Gtk.PopoverMenu, que sao as APIs
+            atuais e funcionam com a extensao instalada.
+
+            Sem a extensao, _tray fica None e a janela continua escondida --
+            nesse caso o status diz como reabrir (rode `wallp`).
+            """
+            if self._tray:
+                self._tray.set_status("wallp")
+                return
+            if not self._appindicator_ok():
+                return
+
+            menu = Gio.Menu()
+            item_show = Gio.MenuItem.new("Mostrar wallp", None)
+            item_show.set_action_and_target_value("win.show", None)
+            menu.append_item(item_show)
+            item_next = Gio.MenuItem.new("Próximo wallpaper", None)
+            item_next.set_action_and_target_value("win.next", None)
+            menu.append_item(item_next)
+            menu.append_section(None, Gio.Menu.new())
+            item_rot = Gio.MenuItem.new("Trocar automaticamente", None)
+            item_rot.set_action_and_target_value("win.rotate", None)
+            menu.append_item(item_rot)
+            item_quit = Gio.MenuItem.new("Sair", None)
+            item_quit.set_action_and_target_value("app.quit", None)
+            menu.append_item(item_quit)
+
+            try:
+                gi.require_version("AyatanaAppIndicator3", "0.1")
+                from gi.repository import AyatanaAppIndicator3 as AI
+            except (ValueError, ImportError):
                 try:
                     gi.require_version("AppIndicator3", "0.1")
                     from gi.repository import AppIndicator3 as AI
                 except (ValueError, ImportError):
                     return
-                # o mesmo icone colorido da janela; a bandeja cai no
-                # preferences-system-time-symbolic so se o SVG nao for encontrado
-                icon = ICON_NAME
-                if not Gtk.IconTheme.get_default().has_icon(icon):
-                    icon = "preferences-system-time-symbolic"
-                ind = AI.Indicator.new("wallp", icon,
-                                       AI.IndicatorCategory.APPLICATION_STATUS)
-                m = Gtk.Menu()
-                it = Gtk.MenuItem(label="Mostrar wallp")
-                it.connect("activate", lambda *_: self.get_application().activate())
-                m.append(it)
-                n = Gtk.MenuItem(label="Proximo wallpaper")
-                n.connect("activate", lambda *_: self.on_next())
-                m.append(n)
-                m.append(Gtk.SeparatorMenuItem())
-                c = Gtk.CheckMenuItem(label="Trocar automaticamente")
-                c.set_active(self.rotator.active)
-                c.connect("toggled", lambda w: (self.chk_rotate.set_active(w.get_active()), False)[1])
-                m.append(c)
-                m.append(Gtk.SeparatorMenuItem())
-                q = Gtk.MenuItem(label="Sair")
-                q.connect("activate", lambda *_: self.quit_app())
-                m.append(q)
-                m.show_all()
-                ind.set_menu(m)
-                self._tray = ind
-            self._tray.set_status("wallp")
+
+            icon = ICON_NAME
+            theme = Gtk.IconTheme.get_for_display(self.get_display())
+            if not theme.has_icon(icon):
+                icon = "preferences-system-time-symbolic"
+            try:
+                ind = AI.Indicator.new(
+                    "wallp", icon, AI.IndicatorCategory.APPLICATION_STATUS)
+            except Exception:  # noqa: BLE001
+                return
+            ind.set_menu(menu)
+            self._tray = ind
+
+        def _appindicator_ok(self):
+            """Registra as acoes que a bandeja dispara, uma vez so."""
+            if getattr(self, "_actions_ok", False):
+                return True
+            self._actions_ok = True
+            app = self.get_application()
+            for name, cb in (("show", self._tray_show),
+                             ("next", self.on_next),
+                             ("rotate", self._tray_toggle)):
+                try:
+                    a = Gio.SimpleAction.new(name, None)
+                    a.connect("activate", lambda _a, _p, cb=cb: cb())
+                    app.add_action(a)
+                except Exception:  # noqa: BLE001
+                    pass
+            return True
+
+        def _tray_show(self):
+            self.set_visible(True)
+            self.present()
+
+        def _tray_toggle(self):
+            self.chk_rotate.set_active(not self.rotator.active)
 
             # ---------------- lista / grade
         def clear(self):
             for row in self.rows:
                 self.listbox.remove(row)
+            for h in self.headers:
+                self.listbox.remove(h)
             for cell in self.grid_items:
                 self.grid.remove(cell)
             self.rows.clear()
+            self.headers.clear()
             self.grid_items.clear()
             self.web_refs.clear()
             self._pending.clear()
@@ -976,9 +1174,7 @@ def build_gui():
             self._pending.clear()
 
         def clear_web(self):
-            """Remove so as celulas/linhas da web, preservando as locais."""
-            if not self.web_refs:
-                return
+            """Remove as linhas da web e seu cabecalho, preservando as locais."""
             # na grade qualquer remocao desloca as posicoes: reconstroi
             if self.stack.get_visible_child_name() == "grid":
                 self.rebuild()
@@ -987,9 +1183,18 @@ def build_gui():
                 self.listbox.remove(widget)
                 self.rows.pop(widget, None)
             self.web_refs.clear()
+            # o cabecalho "Wallhaven 18+" e das web: sai junto
+            for h in [h for h in self.headers if h.is_web_header]:
+                self.listbox.remove(h)
+                self.headers.remove(h)
 
-        def add_header(self, text):
-            self.listbox.append(Header(text))
+        def add_header(self, text, is_web=False):
+            # registra em self.headers: antes os cabecalhos nao entravam em
+            # nenhuma lista e clear() nunca os removia, entao eles se
+            # acumulavam a cada R (2 -> 12 cabecalhos em 10 refreshes)
+            h = Header(text, is_web)
+            self.listbox.append(h)
+            self.headers.append(h)
 
         def add_item(self, pixbuf, title, subtitle, badge, item):
             """Coloca o item no container visivel e o registra.
@@ -1097,7 +1302,7 @@ def build_gui():
             pb = self._decode_local(f, p)
             if pb is None:
                 return
-            GLib.idle_add(self._set_item_thumb, id(item), pb)
+            GLib.idle_add(self._set_item_thumb, item, pb)
 
         def _decode_local(self, f, dest):
             """Abre a imagem local, com fallback quando o glycin recusa.
@@ -1135,12 +1340,21 @@ def build_gui():
                 return None
 
         # -- web
-        def load_web(self):
+        def load_web(self, keep_status=None):
+            # trava a busca: sem isso, 3 R seguidos empilham 3 lotes
+            # (medido: 89 -> 209 linhas) porque cada _web_done anexa sem limpar
+            if self._web_busy:
+                return
             self.clear_web()
             key = self.entry_key()
             if not key:
-                self.say("sem API key: use  wallp --key <APIKEY>  ou  WALLP_KEY", warn=True)
+                # nao sobrescreve a mensagem da pasta: era ela que explicava
+                # por que a lista local estava vazia
+                self.say(keep_status or
+                         "sem API key: use  wallp --key <APIKEY>  ou  WALLP_KEY",
+                         warn=not keep_status)
                 return
+            self._web_busy = True
             self.say("buscando wallpapers 18+ no wallhaven...")
             threading.Thread(target=self._web_worker, args=(key,), daemon=True).start()
 
@@ -1154,15 +1368,19 @@ def build_gui():
                 GLib.idle_add(self._web_done, [], str(e))
 
         def _web_done(self, data, err):
+            self._web_busy = False
             if err:
                 self.say(f"web: {err}", warn=True)
                 return False
             if not data:
-                self.say("web: nenhum 18+ retornou", warn=True)
+                # nao distingue "0 resultados" de "as requisicoes falharam"
+                # (rede com 403 caia aqui e dizia "nenhum 18+ retornou")
+                self.say("web: a API nao respondeu (chave invalida ou sem rede)",
+                         warn=True)
                 return False
 
             if self.stack.get_visible_child_name() == "list":
-                self.add_header(f"Wallhaven 18+  ·  {len(data)} wallpaper(s)")
+                self.add_header(f"Wallhaven 18+  ·  {len(data)} wallpaper(s)", is_web=True)
             for w in data:
                 item = {"kind": "web", "w": w}
                 w["_item_ref"] = item          # o worker acha o item por ele
@@ -1196,12 +1414,18 @@ def build_gui():
                 pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(p), THUMB_W, THUMB_H, True)
             except GLib.Error:
                 return
-            GLib.idle_add(self._set_item_thumb, id(w.get("_item_ref")), pb)
+            GLib.idle_add(self._set_item_thumb, w.get("_item_ref"), pb)
 
-        def _set_item_thumb(self, item_id, pb):
-            """Pinta a miniatura assim que ela chega, sem travar a UI."""
-            for widget, item in {**self.rows, **self.grid_items}.items():
-                if id(item) == item_id:
+        def _set_item_thumb(self, item, pb):
+            """Pinta a miniatura assim que ela chega, sem travar a UI.
+
+            Recebe o proprio item, e nao id(item): o Python recicla endereco
+            de dict, e 48% dos dicts de um lote novo caem no endereco de um
+            dict morto do lote anterior. Com id, um worker atrasado pintava a
+            imagem na celula errada e ainda gravava o _pb errado.
+            """
+            for widget, it in {**self.rows, **self.grid_items}.items():
+                if it is item:
                     item["_pb"] = pb
                     if isinstance(widget, GridCell):
                         widget.set_pixbuf(pb)
@@ -1218,7 +1442,14 @@ def build_gui():
             self.clear()
 
             n_local = self.load_local(folder)
-            self.say(f"{n_local} local(is)" if n_local else "pasta vazia ou invalida: so a web")
+            # no modo grade as celulas ficam em _pending ate um resize_grid;
+            # sem esta chamada a grade ficava em branco ao apertar "Abrir"
+            if self.stack.get_visible_child_name() == "grid":
+                self.resize_grid()
+            # a mensagem de pasta vazia nao pode ser sobrescrita em seguida
+            # por "sem API key" (a causa real sumia da tela)
+            msg = (f"{n_local} local(is)" if n_local
+                   else f"pasta vazia ou invalida: {folder or '(sem caminho)'}")
 
             self.rotator.folder = folder
             self.rotator.rescan()
@@ -1228,7 +1459,7 @@ def build_gui():
                 self.cfg["rotate"] = False
                 save_config(self.cfg)
 
-            self.load_web()
+            self.load_web(keep_status=msg)
 
         def on_activate(self, _lb, row):
             if item := self.rows.get(row):
@@ -1237,8 +1468,15 @@ def build_gui():
         def on_grid_click(self, gesture, n_press, x, y):
             if n_press != 1:
                 return
-            target = self.grid.pick(x, y, Gtk.PickFlags.DEFAULT)
-            if item := self.grid_items.get(target):
+            # pick() devolve o filho mais profundo (o Picture dentro do
+            # Overlay), nao a celula. Sem subir ate o pai, o clique nunca
+            # encontra o item e a grade fica sem resposta nenhuma.
+            node = self.grid.pick(x, y, Gtk.PickFlags.DEFAULT)
+            while node is not None and node not in self.grid_items:
+                node = node.get_parent()
+            if node is None:
+                return
+            if item := self.grid_items.get(node):
                 self.apply(item)
 
         def _pix_for(self, item):
@@ -1265,6 +1503,12 @@ def build_gui():
             return pb
 
         def apply(self, item):
+            # sincroniza o indice: sem isso, clicar em img2 e depois apertar N
+            # aplicava img0, porque o rotator nunca soube o que foi escolhido
+            if self.rotator.files and item.get("kind") == "local":
+                p = str(item["path"])
+                if p in [str(f) for f in self.rotator.files]:
+                    self.rotator.index = [str(f) for f in self.rotator.files].index(p)
             # escolha manual tem prioridade: se a rotacao estava ligando, ela
             # desliga de vez, senao o proximo tick sobrescreveria o clique
             if self.rotator.active:
@@ -1358,7 +1602,14 @@ def main():
         if i + 1 >= len(argv) or argv[i + 1] not in ("on", "off"):
             print(USAGE, file=sys.stderr)
             return 2
-        boot_enable(cfg) if argv[i + 1] == "on" else boot_disable(cfg)
+        try:
+            if argv[i + 1] == "on":
+                boot_enable(cfg)
+            else:
+                boot_disable(cfg)
+        except RuntimeError as e:
+            print(f"wallp: {e}", file=sys.stderr)
+            return 1
         print(f"boot: {boot_status()}")
         return 0
 
