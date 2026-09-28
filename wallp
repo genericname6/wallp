@@ -854,6 +854,8 @@ def build_gui():
             self._width = 0
             self._tray = None
             self._ncols = GRID_COLS_DEFAULT
+            self._cell_geom = None    # (ncols, cw, ch) aplicados por ultimo
+            self._laid_out = -1       # quantas celulas o ultimo layout anexou
             self._resize_id = None    # idle de resize pendente
 
             self.ctrl = Gtk.EventControllerKey()
@@ -1185,6 +1187,8 @@ def build_gui():
             self.grid_items.clear()
             self.web_refs.clear()
             self._ncols = GRID_COLS_DEFAULT
+            self._cell_geom = None
+            self._laid_out = -1
 
         def _relayout(self):
             """Anexa TODAS as celulas em ordem de insercao, com o _ncols atual.
@@ -1300,9 +1304,18 @@ def build_gui():
                 cw = min(cw, (avail_w - (ncols - 1) * 6) / ncols)
             ch = int(cw / GRID_RATIO)
 
+            # saida antecipada: se nada mudou e todas as celulas ja estao
+            # anexadas, nao toca nos widgets. Sem isso, cada tick de resize
+            # fazia detach+attach de todas as celulas mesmo sem mudanca, e
+            # durante um arraste isso empilhava layouts atras do compositor.
+            if (ncols, int(cw), ch) == self._cell_geom and n == self._laid_out:
+                if all(c.get_parent() is self.grid for c in self.grid_items):
+                    return ncols, int(cw), ch
             for cell in self.grid_items:
                 cell.set_size_request(int(cw), ch)
             self._ncols = ncols
+            self._cell_geom = (ncols, int(cw), ch)
+            self._laid_out = n
             self._relayout()                      # reposiciona com o ncols novo
             return ncols, int(cw), ch
 
@@ -1612,36 +1625,27 @@ def build_gui():
             if not w or abs(w - self._width) <= 4:
                 return
             self._width = w
-            # Nao recalcula aqui. Durante um arraste chegam dezenas de
-            # eventos de resize em poucos ms, e medir dentro do size_allocate
-            # pega a largura antiga -- a grade saia com colunas de 6px e nunca
-            # mais se ajustava sozinha, so quando o usuario clicava no toggle.
-            # Adia para um tick de dois frames, que e quando o compositor ja
-            # parado deixa get_width() devolver o valor final.
+            # Debounce de borda FINAL: cancela o pendente e agenda um so,
+            # 120ms depois da ultima mudanca. Antes era um loop que repetia
+            # a cada 45ms enquanto a largura mudava + detach/attach de todas
+            # as celulas a cada tick. Ao encolher, cada tick media a largura
+            # ainda antiga (maior), calculava celulas grandes demais e a
+            # grade pedia mais largura minima do que a janela tinha -- o
+            # compositor brigava com o arraste e tudo travava. Para fora
+            # (aumentar) o erro ia para o outro lado (celulas pequenas,
+            # espaco vazio) e parecia normal. Agora: nenhum layout durante
+            # o arraste, um so quando assentar.
             if self._resize_id:
                 GLib.source_remove(self._resize_id)
-            self._resize_id = GLib.timeout_add(45, self._deferred_resize)
+            self._resize_id = GLib.timeout_add(120, self._deferred_resize)
 
         def _deferred_resize(self):
-            """Recalcula a grade quando a janela ja assentou.
-
-            Repete enquanto a largura estiver mudando: um unico tick pode
-            pegar a largura ainda em transicao, e nesse caso a grade ficava
-            travada no valor errado ate o proximo clique manual.
-            """
+            """Um tiro so: recalcula com a largura ja assentada."""
             self._resize_id = None
             if self.stack.get_visible_child_name() != "grid":
                 return False
-            w = self.get_width()
-            if w <= 0:
-                self._resize_id = GLib.timeout_add(45, self._deferred_resize)
-                return True
+            self._width = self.get_width() or self._width
             self.resize_grid()
-            if abs(w - self._width) > 4:
-                # ainda mexendo: tenta de novo
-                self._width = w
-                self._resize_id = GLib.timeout_add(45, self._deferred_resize)
-                return True
             return False
 
     return Win
